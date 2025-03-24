@@ -20,6 +20,7 @@ RUN apt update && apt install -y \
 
 RUN apt-get update && apt-get install -y \
     ros-${ROS_DISTRO}-gazebo-ros-pkgs \
+    ros-${ROS_DISTRO}-gazebo-plugins \
     ros-${ROS_DISTRO}-gazebo-ros2-control \
     ros-${ROS_DISTRO}-ros-gz \
     ros-${ROS_DISTRO}-ros-ign-bridge

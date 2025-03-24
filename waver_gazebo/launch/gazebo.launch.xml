@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<launch>
+    <arg name="world" default="$(find-pkg-share waver_gazebo)/world/coworking.world" />
+    <arg name="model" default="$(find-pkg-share waver_description)/urdf/waver.xacro" />
+    <arg name="use_sim_time" default="true" />
+
+    <!-- Description launch -->
+    <include file="$(find-pkg-share waver_description)/launch/description.launch.xml">
+        <arg name="use_sim_time" value="$(var use_sim_time)" />
+        <arg name="model" value="$(var model)" />
+    </include>
+
+    <!-- Gazebo launch -->
+    <include file="$(find-pkg-share gazebo_ros)/launch/gazebo.launch.py">
+        <arg name="world" value="$(var world)" />
+        <arg name="verbose" value="true" />
+    </include>
+
+    <!-- Spawn URDF model node -->
+    <node name="spawn_urdf" pkg="gazebo_ros" exec="spawn_entity.py"
+        args="-topic /robot_description -entity waver" output="screen" />
+
+</launch>
