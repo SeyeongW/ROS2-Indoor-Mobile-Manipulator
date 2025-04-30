@@ -8,11 +8,14 @@
   <license>Apache 2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>ros2launch</exec_depend>
   <exec_depend>waver_description</exec_depend>
   <exec_depend>waver_gazebo</exec_depend>
   <exec_depend>waver_viz</exec_depend>
   <exec_depend>navigation2</exec_depend>
+  <exec_depend>nav2</exec_depend>
   <exec_depend>nav2-bringup</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
 
   <export>
     <build_type>ament_cmake</build_type>

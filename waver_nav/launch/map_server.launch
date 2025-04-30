@@ -1,8 +1,0 @@
-<launch>
-    <arg name="map_file" default="$(find-pkg-share waver_nav)/maps/coworking_map.yaml" />
-
-    <!-- Map server node -->
-    <node name="map_server" pkg="nav2_map_server" exec="map_server" output="screen">
-        <param name="yaml_filename" value="$(var map_file)" />
-    </node>
-</launch>
