@@ -8,7 +8,6 @@
   <license>Apache 2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <exec_depend>ros2launch</exec_depend>
   <exec_depend>rviz</exec_depend>
   
   <export>
