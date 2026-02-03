@@ -1,24 +1,34 @@
 <?xml version="1.0"?>
 <launch>
-    <arg name="world" default="$(find-pkg-share waver_gazebo)/world/coworking.world" />
-    <arg name="model" default="$(find-pkg-share waver_description)/urdf/waver.xacro" />
     <arg name="use_sim_time" default="true" />
+    <arg name="model" default="$(find-pkg-share waver_description)/urdf/waver.xacro" />
+    <arg name="world_file" default="empty.sdf" />
 
-    <!-- Description launch -->
     <include file="$(find-pkg-share waver_description)/launch/description.launch.xml">
         <arg name="use_sim_time" value="$(var use_sim_time)" />
         <arg name="model" value="$(var model)" />
     </include>
 
-    <!-- Gazebo launch -->
-    <include file="$(find-pkg-share gazebo_ros)/launch/gazebo.launch.py">
-        <arg name="world" value="$(var world)" />
-        <arg name="verbose" value="true" />
-        <arg name="gui_required" value="true" />
+    <include file="$(find-pkg-share ros_gz_sim)/launch/gz_sim.launch.py">
+        <arg name="gz_args" value="-r -v 4 $(var world_file)" />
     </include>
 
-    <!-- Spawn URDF model node -->
-    <node name="spawn_urdf" pkg="gazebo_ros" exec="spawn_entity.py"
-        args="-topic /robot_description -entity waver" output="screen" />
+    <node pkg="ros_gz_sim" exec="create" name="spawn_waver"
+        args="-name waver -topic robot_description"
+        output="screen" />
+
+    <node pkg="ros_gz_bridge" exec="parameter_bridge" name="ros_gz_bridge"
+        args="/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock
+              /cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist
+              /odometry@nav_msgs/msg/Odometry@gz.msgs.Odometry
+              /scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan
+              /tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V">
+
+        <param name="config_file" value="" />
+        <param name="use_sim_time" value="true" />
+
+        <remap from="/model/waver/odometry" to="/odometry" />
+        <remap from="/model/waver/scan" to="/scan" />
+    </node>
 
 </launch>
