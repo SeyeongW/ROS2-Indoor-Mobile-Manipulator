@@ -41,10 +41,10 @@
 
     <gazebo reference="zed_x_mini_link">
         <material>Gazebo/Black</material>
-        <sensor name="depth" type="depth">
+        <sensor name="depth" type="depth_camera">
             <visualize>true</visualize>
             <update_rate>60.0</update_rate>
-
+            <topic>depth_camera</topic>
             <camera>
                 <horizontal_fov>1.047198</horizontal_fov>
                 <image>
@@ -62,25 +62,6 @@
                     <stddev>0.007</stddev>
                 </noise>
             </camera>
-
-            <plugin name="depth_camera_controller" filename="libgazebo_ros_camera.so">
-                <baseline>0.05</baseline>
-                <alwaysOn>true</alwaysOn>
-                <updateRate>60.0</updateRate>
-                <frame_name>zed_x_mini_optical_frame</frame_name>
-                <pointCloudCutoff>0.1</pointCloudCutoff>
-                <pointCloudCutoffMax>8.0</pointCloudCutoffMax>
-                <distortionK1>0</distortionK1>
-                <distortionK2>0</distortionK2>
-                <distortionK3>0</distortionK3>
-                <distortionT1>0</distortionT1>
-                <distortionT2>0</distortionT2>
-                <CxPrime>0</CxPrime>
-                <Cx>0</Cx>
-                <Cy>0</Cy>
-                <focalLength>0</focalLength>
-                <hackBaseline>0</hackBaseline>
-            </plugin>
         </sensor>
     </gazebo>
 
