@@ -1,15 +1,26 @@
 <?xml version="1.0"?>
 <robot name="waver" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
+  <xacro:arg name="sim_control" default="gazebo" />
   <xacro:arg name="camera_type" default="raspi" />
 
   <xacro:include filename="$(find waver_description)/urdf/materials.xacro" />
   <xacro:include filename="$(find waver_description)/urdf/util.xacro" />
-  <xacro:include filename="$(find waver_description)/urdf/waver.trans.xacro" />
-  <xacro:include filename="$(find waver_description)/urdf/waver.gazebo.xacro" />
   <xacro:include filename="$(find waver_description)/urdf/lidar.xacro" />
   <xacro:include filename="$(find waver_description)/urdf/imu.xacro" />
-  
+
+  <!-- ************************** Simulation Control ************************** -->
+
+  <xacro:if value="${'$(arg sim_control)' == 'gazebo'}">
+    <xacro:include filename="$(find waver_description)/urdf/waver.gazebo.xacro" />
+  </xacro:if>
+
+  <xacro:if value="${'$(arg sim_control)' == 'ros2'}">
+    <xacro:include filename="$(find waver_description)/urdf/waver.control.xacro" />
+  </xacro:if>
+
+  <!-- ***************************** Camera Type ***************************** -->
+
   <xacro:if value="${'$(arg camera_type)' == 'raspi'}">
     <xacro:include filename="$(find waver_description)/urdf/rasp_pi_camera.xacro" />
   </xacro:if>

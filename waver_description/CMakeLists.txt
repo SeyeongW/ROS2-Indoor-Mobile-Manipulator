@@ -19,7 +19,7 @@ if(BUILD_TESTING)
 endif()
 
 # Install all description resources
-install(DIRECTORY launch meshes urdf
+install(DIRECTORY config launch meshes urdf
   DESTINATION share/${PROJECT_NAME}/
 )
 
