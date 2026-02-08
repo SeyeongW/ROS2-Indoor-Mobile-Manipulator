@@ -66,6 +66,7 @@
 
     <xacro:property name="wheel_separation" value="123e-3" />
     <xacro:property name="wheel_radius" value="40.6e-3" />
+    <xacro:property name="wheel_width" value="42.5e-3" />
 
     <!-- WBL specifications -->
     <xacro:property name="pos_x_wbl" value="0.06538582611083985" />

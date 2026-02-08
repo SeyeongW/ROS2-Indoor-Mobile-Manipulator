@@ -159,10 +159,9 @@
       <xacro:black_material />
     </visual>
     <collision>
-      <origin xyz="${position_wbl}" rpy="0 0 ${pi/2}" />
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0" />
       <geometry>
-        <mesh filename="package://waver_description/meshes/wheel_back_left_link.stl"
-          scale="${scale}" />
+        <cylinder radius="${wheel_radius}" length="${wheel_width}" />
       </geometry>
     </collision>
   </link>
@@ -183,10 +182,9 @@
       <xacro:black_material />
     </visual>
     <collision>
-      <origin xyz="${position_wfl}" rpy="0 0 ${pi/2}" />
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0" />
       <geometry>
-        <mesh filename="package://waver_description/meshes/wheel_front_left_link.stl"
-          scale="${scale}" />
+        <cylinder radius="${wheel_radius}" length="${wheel_width}" />
       </geometry>
     </collision>
   </link>
@@ -207,10 +205,9 @@
       <xacro:black_material />
     </visual>
     <collision>
-      <origin xyz="${position_wfr}" rpy="0 0 ${pi/2}" />
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0" />
       <geometry>
-        <mesh filename="package://waver_description/meshes/wheel_front_right_link.stl"
-          scale="${scale}" />
+        <cylinder radius="${wheel_radius}" length="${wheel_width}" />
       </geometry>
     </collision>
   </link>
@@ -231,10 +228,9 @@
       <xacro:black_material />
     </visual>
     <collision>
-      <origin xyz="${position_wbr}" rpy="0 0 ${pi/2}" />
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0" />
       <geometry>
-        <mesh filename="package://waver_description/meshes/wheel_back_right_link.stl"
-          scale="${scale}" />
+        <cylinder radius="${wheel_radius}" length="${wheel_width}" />
       </geometry>
     </collision>
   </link>
