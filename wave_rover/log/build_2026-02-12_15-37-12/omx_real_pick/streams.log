@@ -1,0 +1,84 @@
+[0.007s] Invoking command in '/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/seyeongw/ros2_ws/install/ros2_aruco:/home/seyeongw/ros2_ws/install/camera_detection:/opt/ros/humble /usr/bin/cmake /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/omx_real_pick -DCMAKE_INSTALL_PREFIX=/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick
+[0.081s] -- The C compiler identification is GNU 11.4.0
+[0.138s] -- The CXX compiler identification is GNU 11.4.0
+[0.144s] -- Detecting C compiler ABI info
+[0.195s] -- Detecting C compiler ABI info - done
+[0.199s] -- Check for working C compiler: /usr/bin/cc - skipped
+[0.199s] -- Detecting C compile features
+[0.199s] -- Detecting C compile features - done
+[0.202s] -- Detecting CXX compiler ABI info
+[0.254s] -- Detecting CXX compiler ABI info - done
+[0.258s] -- Check for working CXX compiler: /usr/bin/c++ - skipped
+[0.258s] -- Detecting CXX compile features
+[0.258s] -- Detecting CXX compile features - done
+[0.262s] -- Found ament_cmake: 1.3.12 (/opt/ros/humble/share/ament_cmake/cmake)
+[0.382s] -- Found Python3: /usr/bin/python3 (found version "3.10.12") found components: Interpreter 
+[0.462s] -- Found rclcpp: 16.0.17 (/opt/ros/humble/share/rclcpp/cmake)
+[0.505s] -- Found rosidl_generator_c: 3.1.8 (/opt/ros/humble/share/rosidl_generator_c/cmake)
+[0.511s] -- Found rosidl_adapter: 3.1.8 (/opt/ros/humble/share/rosidl_adapter/cmake)
+[0.520s] -- Found rosidl_generator_cpp: 3.1.8 (/opt/ros/humble/share/rosidl_generator_cpp/cmake)
+[0.532s] -- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+[0.547s] -- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+[0.589s] -- Found rmw_implementation_cmake: 6.1.2 (/opt/ros/humble/share/rmw_implementation_cmake/cmake)
+[0.593s] -- Found rmw_fastrtps_cpp: 6.2.9 (/opt/ros/humble/share/rmw_fastrtps_cpp/cmake)
+[0.676s] -- Found OpenSSL: /usr/lib/x86_64-linux-gnu/libcrypto.so (found version "3.0.2")  
+[0.697s] -- Found FastRTPS: /opt/ros/humble/include  
+[0.724s] -- Using RMW implementation 'rmw_fastrtps_cpp' as default
+[0.733s] -- Looking for pthread.h
+[0.788s] -- Looking for pthread.h - found
+[0.788s] -- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+[0.846s] -- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+[0.847s] -- Found Threads: TRUE  
+[0.891s] -- Found rclcpp_action: 16.0.17 (/opt/ros/humble/share/rclcpp_action/cmake)
+[0.921s] -- Found moveit_ros_planning_interface: 2.5.9 (/opt/ros/humble/share/moveit_ros_planning_interface/cmake)
+[0.948s] -- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake (found version "1.74.0") found components: date_time filesystem program_options system thread 
+[1.067s] -- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake (found version "1.74.0") found components: chrono date_time filesystem iostreams program_options regex serialization system thread 
+[1.106s] -- Found parameter_traits: 0.6.0 (/opt/ros/humble/share/parameter_traits/cmake)
+[1.118s] -- Found rclcpp_lifecycle: 16.0.17 (/opt/ros/humble/share/rclcpp_lifecycle/cmake)
+[1.140s] -- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake (found version "1.74.0") found components: filesystem 
+[1.216s] -- library: /usr/lib/x86_64-linux-gnu/libcurl.so
+[1.243s] -- Found Eigen3: TRUE (found version "3.4.0") 
+[1.244s] -- Ensuring Eigen3 include directory is part of orocos-kdl CMake target
+[1.350s] -- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake (found version "1.74.0") found components: system filesystem date_time program_options thread chrono 
+[1.373s] -- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake (found version "1.74.0") found components: thread system filesystem regex date_time program_options 
+[1.389s] -- Found Boost: /usr/lib/x86_64-linux-gnu/cmake/Boost-1.74.0/BoostConfig.cmake (found version "1.74.0") found components: system filesystem date_time program_options thread 
+[1.412s] -- Found control_msgs: 4.8.0 (/opt/ros/humble/share/control_msgs/cmake)
+[1.429s] -- Found ros2_aruco_interfaces: 0.1.0 (/home/seyeongw/ros2_ws/install/ros2_aruco_interfaces/share/ros2_aruco_interfaces/cmake)
+[1.505s] -- Configuring done
+[1.527s] -- Generating done
+[1.532s] -- Build files have been written to: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick
+[1.542s] Invoked command in '/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/seyeongw/ros2_ws/install/ros2_aruco:/home/seyeongw/ros2_ws/install/camera_detection:/opt/ros/humble /usr/bin/cmake /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/omx_real_pick -DCMAKE_INSTALL_PREFIX=/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick
+[1.543s] Invoking command in '/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/seyeongw/ros2_ws/install/ros2_aruco:/home/seyeongw/ros2_ws/install/camera_detection:/opt/ros/humble /usr/bin/cmake --build /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick -- -j18 -l18
+[1.583s] [ 50%] [32mBuilding CXX object CMakeFiles/real_pick_node.dir/src/real_pick_node.cpp.o[0m
+[6.173s] [01m[K/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/omx_real_pick/src/real_pick_node.cpp:19:15:[m[K [01;35m[Kwarning: [m[K‘[01m[Kdouble clamp(double, double, double)[m[K’ defined but not used [[01;35m[K]8;;https://gcc.gnu.org/onlinedocs/gcc/Warning-Options.html#index-Wunused-function-Wunused-function]8;;[m[K]
+[6.174s]    19 | static double [01;35m[Kclamp[m[K(double v, double lo, double hi) {
+[6.174s]       |               [01;35m[K^~~~~[m[K
+[6.757s] [100%] [32m[1mLinking CXX executable real_pick_node[0m
+[7.079s] [100%] Built target real_pick_node
+[7.088s] Invoked command in '/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/seyeongw/ros2_ws/install/ros2_aruco:/home/seyeongw/ros2_ws/install/camera_detection:/opt/ros/humble /usr/bin/cmake --build /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick -- -j18 -l18
+[7.097s] Invoking command in '/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/seyeongw/ros2_ws/install/ros2_aruco:/home/seyeongw/ros2_ws/install/camera_detection:/opt/ros/humble /usr/bin/cmake --install /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick
+[7.102s] -- Install configuration: ""
+[7.103s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/lib/omx_real_pick/real_pick_node
+[7.103s] -- Set runtime path of "/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/lib/omx_real_pick/real_pick_node" to ""
+[7.103s] -- Up-to-date: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/lib/omx_real_pick
+[7.103s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/lib/omx_real_pick/aruco_realsense.py
+[7.103s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/lib/omx_real_pick/marker_scanner.py
+[7.103s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/launch
+[7.103s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/launch/hardware.launch.py
+[7.103s] -- Up-to-date: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/lib/omx_real_pick/aruco_realsense.py
+[7.103s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/ament_index/resource_index/package_run_dependencies/omx_real_pick
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/ament_index/resource_index/parent_prefix_path/omx_real_pick
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/environment/ament_prefix_path.sh
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/environment/ament_prefix_path.dsv
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/environment/path.sh
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/environment/path.dsv
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/local_setup.bash
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/local_setup.sh
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/local_setup.zsh
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/local_setup.dsv
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/package.dsv
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/ament_index/resource_index/packages/omx_real_pick
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/cmake/omx_real_pickConfig.cmake
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/cmake/omx_real_pickConfig-version.cmake
+[7.104s] -- Installing: /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/install/omx_real_pick/share/omx_real_pick/package.xml
+[7.105s] Invoked command in '/home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/seyeongw/ros2_ws/install/ros2_aruco:/home/seyeongw/ros2_ws/install/camera_detection:/opt/ros/humble /usr/bin/cmake --install /home/seyeongw/ros2_ws/src/ROS2-Indoor-Mobile-Manipulator/build/omx_real_pick

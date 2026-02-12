@@ -1,0 +1,1 @@
+rclcpp;rclcpp_action;moveit_ros_planning_interface;moveit_ros_move_group;geometry_msgs;control_msgs;tf2_ros;tf2_geometry_msgs;ros2_aruco_interfaces;sensor_msgs;python3-opencv;python3-numpy;realsense2_camera;ament_lint_auto;ament_lint_common
