@@ -21,3 +21,8 @@ Open a new terminal and run the main application (Camera + Tracking + Control).
 ```bash
 ros2 launch omx_real_pick hardware.launch.py
 ```
+
+## ssh jetson
+```bash
+ ssh sw@10.24.191.150
+```
