@@ -1,15 +1,3 @@
-// real_pick_node.cpp (FULL, 안정화 버전)
-// 핵심 변경점:
-// 1) HOME -> gripper open -> WAIT
-// 2) marker TF로 pregrasp/final 위치는 만들되
-// 3) OM-X에서 IK가 잘 풀리도록 "orientation은 강제하지 않음"
-//    - GoalOrientationTolerance = 3.14 (사실상 무시)
-//    - pregrasp/final orientation = 현재 end-effector orientation 유지
-// 4) PREGRASP는 setPoseTarget() 대신 setPositionTarget() (position-only)
-// 5) APPROACH는 computeCartesianPath로 final 위치까지 직선 접근 (orientation 유지)
-// 6) Z는 camera-on-EE 구조에서 튀기 쉬움 -> z_work로 고정 (권장)
-
-// 필요 헤더
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
@@ -18,10 +6,9 @@
 
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-#include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/pose.hpp>
 
 #include <ros2_aruco_interfaces/msg/aruco_markers.hpp>
 
@@ -68,6 +55,7 @@ static void operateGripper(rclcpp::Node::SharedPtr node,
 enum class FSM {
   HOME_INIT,
   WAIT_MARKER,
+  CENTER_ON_MARKER,  // ✅ 화면 중앙 정렬(visual servo)
   PREGRASP,
   APPROACH,
   GRASP,
@@ -79,7 +67,6 @@ int main(int argc, char** argv) {
 
   auto node = std::make_shared<rclcpp::Node>("real_pick_node");
 
-  // Spin background
   auto exec = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   exec->add_node(node);
   std::thread spinner([&exec](){ exec->spin(); });
@@ -90,13 +77,13 @@ int main(int argc, char** argv) {
 
   // --------------- MoveIt -------------
   moveit::planning_interface::MoveGroupInterface arm(node, "arm");
-  arm.setMaxVelocityScalingFactor(0.15);
-  arm.setMaxAccelerationScalingFactor(0.15);
-  arm.setPlanningTime(5.0);
+  arm.setMaxVelocityScalingFactor(0.20);
+  arm.setMaxAccelerationScalingFactor(0.20);
+  arm.setPlanningTime(3.0);
 
-  // ✅ Position 중심. Orientation은 강제하지 않음(OM-X IK 안정)
-  arm.setGoalPositionTolerance(0.01);     // 1 cm
-  arm.setGoalOrientationTolerance(3.14);  // ✅ 사실상 무시
+  // Position 중심 (orientation 강제 X)
+  arm.setGoalPositionTolerance(0.01);
+  arm.setGoalOrientationTolerance(3.14);
 
   // -------------- Gripper -------------
   auto gripper = rclcpp_action::create_client<GripperCommand>(
@@ -104,6 +91,7 @@ int main(int argc, char** argv) {
 
   // ---------- SETTINGS ----------
   const std::string base_frame    = "link1";
+  const std::string camera_frame  = "camera_link";     // ✅ aruco 노드 parent frame
   const std::string markers_topic = "/aruco/markers";
 
   const double GRIP_OPEN  = 0.019;
@@ -111,38 +99,48 @@ int main(int argc, char** argv) {
 
   // TF freshness + stabilization
   const double max_tf_age_sec = 1.0;
-  const int stable_need = 5;
-  int stable_count = 0;
 
   // Marker selection bounds (from /aruco/markers camera-depth)
   const double marker_z_min = 0.05;
   const double marker_z_max = 2.00;
 
-  // Approach tuning
-  const double pregrasp_dist = 0.12;   // 12 cm away (normal direction)
-  const double grasp_dist    = 0.03;   // 3 cm away
+  // Centering (visual servo) gains
+  const double K_yaw   = 0.8;   // joint1 보정 gain
+  const double K_pitch = 0.8;   // joint2 보정 gain
+  const double max_step_rad = 0.20; // 한 번에 최대 보정(라디안) 제한
+
+  // Centering threshold
+  const double yaw_tol_rad   = 3.0 * M_PI / 180.0;   // 3 deg
+  const double pitch_tol_rad = 3.0 * M_PI / 180.0;   // 3 deg
+  const int center_need = 5;
+  int center_count = 0;
+
+  // Joint limits (대략 OM-X 기본 제한에 맞춘 보수값; 필요시 조절)
+  const double j1_min = -M_PI, j1_max = M_PI;
+  const double j2_min = -1.5,  j2_max = 1.5;
+
+  // Grasp pipeline tuning
+  const double pregrasp_dist = 0.12;
+  const double grasp_dist    = 0.03;
   const double lift_dist     = 0.10;
 
   // Cartesian
-  const double cart_step     = 0.01;   // 1 cm step
+  const double cart_step     = 0.01;
   const double cart_jump_th  = 0.0;
   const double min_cart_frac = 0.85;
 
-  // "Reached grasp pose?" 판단
-  const double grasp_pos_tol = 0.02;   // 2 cm
+  // Reached
+  const double grasp_pos_tol = 0.02;
+
+  // Workspace: Z 고정 (카메라 EE 장착 구조 안정화)
+  const double z_min = 0.05;
+  const double z_max = 0.35;
+  const double z_work = 0.22;
+  const double xy_max = 0.30;
 
   // Failure handling
   int fail_count = 0;
   const int max_fail = 3;
-
-  // ---- Workspace clamp (IMPORTANT) ----
-  // camera-on-EE 구조에서는 marker(base).z가 작업 평면 높이와 무관하게 튈 수 있음.
-  // 그래서 z를 고정(z_work) 또는 clamp.
-  const double z_min = 0.05;
-  const double z_max = 0.35;
-  const double z_work = 0.22;          // ✅ 네 환경에 맞게 튜닝(테이블 위 높이)
-  const bool   use_fixed_z = true;     // ✅ true 추천
-  const double xy_max = 0.30;
 
   // ---------- /aruco/markers cache ----------
   std::mutex mk_mtx;
@@ -178,14 +176,15 @@ int main(int argc, char** argv) {
     return best_id;
   };
 
-  auto getFreshMarkerTF = [&](const std::string& target_marker_frame,
-                              geometry_msgs::msg::TransformStamped& out) -> bool
+  auto getFreshTF = [&](const std::string& target, const std::string& source,
+                        geometry_msgs::msg::TransformStamped& out) -> bool
   {
+    // want: source -> target (lookupTransform(target_frame, source_frame))
     try {
-      if (!tf_buffer->canTransform(base_frame, target_marker_frame, tf2::TimePointZero, 50ms))
+      if (!tf_buffer->canTransform(target, source, tf2::TimePointZero, 50ms))
         return false;
 
-      auto t = tf_buffer->lookupTransform(base_frame, target_marker_frame, tf2::TimePointZero);
+      auto t = tf_buffer->lookupTransform(target, source, tf2::TimePointZero);
 
       rclcpp::Time now = node->get_clock()->now();
       rclcpp::Time stamp = rclcpp::Time(t.header.stamp);
@@ -202,24 +201,7 @@ int main(int argc, char** argv) {
     }
   };
 
-  auto tfToPose = [&](const geometry_msgs::msg::TransformStamped& t) -> geometry_msgs::msg::Pose {
-    geometry_msgs::msg::Pose p;
-    p.position.x = t.transform.translation.x;
-    p.position.y = t.transform.translation.y;
-    p.position.z = t.transform.translation.z;
-    p.orientation = t.transform.rotation;
-    return p;
-  };
-
-  // marker frame z-axis in base frame: R(q_marker) * (0,0,1)
-  auto markerZAxisInBase = [&](const geometry_msgs::msg::Pose& marker_pose) -> tf2::Vector3 {
-    tf2::Quaternion q;
-    tf2::fromMsg(marker_pose.orientation, q);
-    tf2::Matrix3x3 R(q);
-    return R * tf2::Vector3(0,0,1);
-  };
-
-  // ---------- FSM state ----------
+  // ---------- FSM ----------
   FSM state = FSM::HOME_INIT;
 
   int target_id = -1;
@@ -234,15 +216,15 @@ int main(int argc, char** argv) {
     switch (state) {
 
       case FSM::HOME_INIT: {
-        RCLCPP_INFO(node->get_logger(), ">> HOME_INIT: moving to 'home' and opening gripper");
+        RCLCPP_INFO(node->get_logger(), ">> HOME_INIT: go 'home', gripper open");
         arm.setNamedTarget("home");
         arm.move();
         rclcpp::sleep_for(500ms);
 
         operateGripper(node, gripper, GRIP_OPEN);
 
-        stable_count = 0;
         fail_count = 0;
+        center_count = 0;
         target_id = -1;
         target_frame.clear();
 
@@ -253,7 +235,6 @@ int main(int argc, char** argv) {
       case FSM::WAIT_MARKER: {
         const int best = selectClosestMarkerId();
         if (best < 0) {
-          stable_count = 0;
           RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 2000,
                                ">> WAIT_MARKER: no marker yet");
           break;
@@ -262,81 +243,129 @@ int main(int argc, char** argv) {
         if (best != target_id) {
           target_id = best;
           target_frame = "aruco_marker_" + std::to_string(target_id);
-          stable_count = 0;
+          center_count = 0;
           RCLCPP_INFO(node->get_logger(), ">> Target marker set to ID=%d (%s)",
                       target_id, target_frame.c_str());
         }
 
-        geometry_msgs::msg::TransformStamped t_base_marker;
-        if (!getFreshMarkerTF(target_frame, t_base_marker)) {
-          stable_count = 0;
+        // marker가 camera 프레임에서라도 보이는지(신선한 TF)
+        geometry_msgs::msg::TransformStamped t_cam_marker;
+        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+          center_count = 0;
           break;
         }
 
-        stable_count++;
-        auto marker_pose = tfToPose(t_base_marker);
+        // 보이면 CENTER 단계로
+        state = FSM::CENTER_ON_MARKER;
+        break;
+      }
 
-        RCLCPP_INFO(node->get_logger(), ">> STABLE %d/%d  marker(base)=(%.3f %.3f %.3f)",
-                    stable_count, stable_need,
-                    marker_pose.position.x, marker_pose.position.y, marker_pose.position.z);
-
-        if (stable_count < stable_need) break;
-
-        // ✅ orientation은 현재 EE orientation 유지(OM-X IK 안정)
-        auto ee_now = arm.getCurrentPose().pose;
-
-        // 위치는 marker normal 기반으로 생성(접근 방향성 유지)
-        tf2::Vector3 z_axis = markerZAxisInBase(marker_pose);
-
-        // 접근이 반대로 가면 이 줄을 켜라:
-        // z_axis = -z_axis;
-
-        // Final pose
-        final_pose = marker_pose;
-        final_pose.orientation = ee_now.orientation;   // ✅ 유지
-        final_pose.position.x += z_axis.x() * grasp_dist;
-        final_pose.position.y += z_axis.y() * grasp_dist;
-        final_pose.position.z += z_axis.z() * grasp_dist;
-
-        // Pregrasp pose
-        pregrasp_pose = marker_pose;
-        pregrasp_pose.orientation = ee_now.orientation; // ✅ 유지
-        pregrasp_pose.position.x += z_axis.x() * pregrasp_dist;
-        pregrasp_pose.position.y += z_axis.y() * pregrasp_dist;
-        pregrasp_pose.position.z += z_axis.z() * pregrasp_dist;
-
-        // ---- Z FIX/CLAMP ----
-        if (use_fixed_z) {
-          pregrasp_pose.position.z = z_work;
-          final_pose.position.z    = z_work;   // 필요하면 z_work - 0.02
-        } else {
-          pregrasp_pose.position.z = clamp(pregrasp_pose.position.z, z_min, z_max);
-          final_pose.position.z    = clamp(final_pose.position.z,    z_min, z_max);
+      case FSM::CENTER_ON_MARKER: {
+        if (target_frame.empty()) {
+          state = FSM::WAIT_MARKER;
+          break;
         }
-        pregrasp_pose.position.z = clamp(pregrasp_pose.position.z, z_min, z_max);
-        final_pose.position.z    = clamp(final_pose.position.z,    z_min, z_max);
 
-        // XY clamp
-        pregrasp_pose.position.x = clamp(pregrasp_pose.position.x, -xy_max, xy_max);
-        pregrasp_pose.position.y = clamp(pregrasp_pose.position.y, -xy_max, xy_max);
-        final_pose.position.x    = clamp(final_pose.position.x,    -xy_max, xy_max);
-        final_pose.position.y    = clamp(final_pose.position.y,    -xy_max, xy_max);
+        geometry_msgs::msg::TransformStamped t_cam_marker;
+        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+          center_count = 0;
+          RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
+                               ">> CENTER: marker TF not fresh");
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        const double x = t_cam_marker.transform.translation.x;
+        const double y = t_cam_marker.transform.translation.y;
+        const double z = t_cam_marker.transform.translation.z;
+
+        // 화면 중심 각도 오차 (카메라 기준)
+        const double yaw_err   = std::atan2(x, z);
+        const double pitch_err = std::atan2(-y, z);
 
         RCLCPP_INFO(node->get_logger(),
-                    ">> Built poses(Z fixed=%s): pre(%.3f %.3f %.3f) final(%.3f %.3f %.3f)",
-                    use_fixed_z ? "true" : "false",
-                    pregrasp_pose.position.x, pregrasp_pose.position.y, pregrasp_pose.position.z,
-                    final_pose.position.x,  final_pose.position.y,  final_pose.position.z);
+                    ">> CENTER: yaw_err=%.2fdeg pitch_err=%.2fdeg (x=%.3f y=%.3f z=%.3f)",
+                    yaw_err * 180.0 / M_PI, pitch_err * 180.0 / M_PI, x, y, z);
 
-        state = FSM::PREGRASP;
+        // 목표 중심 도달 판정
+        if (std::abs(yaw_err) < yaw_tol_rad && std::abs(pitch_err) < pitch_tol_rad) {
+          center_count++;
+          RCLCPP_INFO(node->get_logger(), ">> CENTER OK %d/%d", center_count, center_need);
+        } else {
+          center_count = 0;
+        }
+
+        if (center_count >= center_need) {
+          // 이제 base->marker로 pregrasp/final 생성하고 그랩 시도
+          geometry_msgs::msg::TransformStamped t_base_marker;
+          if (!getFreshTF(base_frame, target_frame, t_base_marker)) {
+            center_count = 0;
+            state = FSM::WAIT_MARKER;
+            break;
+          }
+
+          // 중심점(마커) 기반 pregrasp/final: x/y는 marker 기준, z는 작업높이 고정
+          const double mx = t_base_marker.transform.translation.x;
+          const double my = t_base_marker.transform.translation.y;
+
+          // 간단히 base x축 방향으로 앞/뒤 오프셋 주는 대신,
+          // 마커 법선 기반까지 하려면 orientation이 필요하지만 OM-X에선 IK가 빡세서
+          // 일단 "센터링 후"에는 위치만으로 접근(안정).
+          pregrasp_pose.position.x = clamp(mx + pregrasp_dist, -xy_max, xy_max);
+          pregrasp_pose.position.y = clamp(my,              -xy_max, xy_max);
+          pregrasp_pose.position.z = clamp(z_work, z_min, z_max);
+
+          final_pose.position.x = clamp(mx + grasp_dist, -xy_max, xy_max);
+          final_pose.position.y = clamp(my,            -xy_max, xy_max);
+          final_pose.position.z = clamp(z_work, z_min, z_max);
+
+          // orientation은 현재 EE 유지
+          auto ee_now = arm.getCurrentPose().pose;
+          pregrasp_pose.orientation = ee_now.orientation;
+          final_pose.orientation    = ee_now.orientation;
+
+          RCLCPP_INFO(node->get_logger(),
+                      ">> CENTER DONE. pre=(%.3f %.3f %.3f) final=(%.3f %.3f %.3f)",
+                      pregrasp_pose.position.x, pregrasp_pose.position.y, pregrasp_pose.position.z,
+                      final_pose.position.x, final_pose.position.y, final_pose.position.z);
+
+          state = FSM::PREGRASP;
+          break;
+        }
+
+        // 아직 중심이 아니면: joint1/joint2를 조금씩 보정
+        std::vector<double> joints = arm.getCurrentJointValues();
+        if (joints.size() < 2) {
+          RCLCPP_ERROR(node->get_logger(), "Joint vector too small");
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        double dyaw   = clamp(K_yaw   * yaw_err,   -max_step_rad, max_step_rad);
+        double dpitch = clamp(K_pitch * pitch_err, -max_step_rad, max_step_rad);
+
+        // joint1: yaw, joint2: pitch(어깨)
+        joints[0] = clamp(joints[0] + dyaw,   j1_min, j1_max);
+        joints[1] = clamp(joints[1] + dpitch, j2_min, j2_max);
+
+        arm.setStartStateToCurrentState();
+        arm.setJointValueTarget(joints);
+
+        auto res = arm.move();
+        if (res != moveit::core::MoveItErrorCode::SUCCESS) {
+          fail_count++;
+          RCLCPP_ERROR(node->get_logger(), "CENTER move failed (%d/%d)", fail_count, max_fail);
+          if (fail_count >= max_fail) state = FSM::HOME_INIT;
+          else state = FSM::WAIT_MARKER;
+        } else {
+          fail_count = 0;
+        }
         break;
       }
 
       case FSM::PREGRASP: {
-        RCLCPP_INFO(node->get_logger(), ">> PREGRASP: planning to pregrasp (position-only)");
+        RCLCPP_INFO(node->get_logger(), ">> PREGRASP: move to pregrasp (position-only)");
         arm.setStartStateToCurrentState();
-
-        // ✅ pose target 대신 position-only target (IK 성공률 ↑)
         arm.setPositionTarget(pregrasp_pose.position.x,
                               pregrasp_pose.position.y,
                               pregrasp_pose.position.z);
@@ -356,7 +385,7 @@ int main(int argc, char** argv) {
       }
 
       case FSM::APPROACH: {
-        RCLCPP_INFO(node->get_logger(), ">> APPROACH: cartesian to final (orientation 유지)");
+        RCLCPP_INFO(node->get_logger(), ">> APPROACH: cartesian to final");
         std::vector<geometry_msgs::msg::Pose> waypoints;
         waypoints.push_back(final_pose);
 
@@ -368,7 +397,7 @@ int main(int argc, char** argv) {
 
         if (frac < min_cart_frac) {
           fail_count++;
-          RCLCPP_ERROR(node->get_logger(), "Cartesian path too low (%.2f) (%d/%d)", frac, fail_count, max_fail);
+          RCLCPP_ERROR(node->get_logger(), "Cartesian too low (%.2f) (%d/%d)", frac, fail_count, max_fail);
           if (fail_count >= max_fail) state = FSM::HOME_INIT;
           else state = FSM::WAIT_MARKER;
           break;
@@ -386,30 +415,28 @@ int main(int argc, char** argv) {
           break;
         }
 
+        // grasp 위치 도달 판단(포지션 오차)
         auto ee = arm.getCurrentPose().pose;
         const double err = dist3(ee.position, final_pose.position);
-        RCLCPP_INFO(node->get_logger(), ">> EE position error to final: %.3f m", err);
+        RCLCPP_INFO(node->get_logger(), ">> EE pos err=%.3f m", err);
 
-        if (err <= grasp_pos_tol) {
-          state = FSM::GRASP;
-        } else {
-          RCLCPP_WARN(node->get_logger(), ">> Not close enough to grasp. Back to WAIT_MARKER");
-          state = FSM::WAIT_MARKER;
-        }
+        if (err <= grasp_pos_tol) state = FSM::GRASP;
+        else state = FSM::WAIT_MARKER;
+
         break;
       }
 
       case FSM::GRASP: {
-        RCLCPP_INFO(node->get_logger(), ">> GRASP: closing gripper");
+        RCLCPP_INFO(node->get_logger(), ">> GRASP: close gripper");
         operateGripper(node, gripper, GRIP_CLOSE);
         state = FSM::LIFT_HOME;
         break;
       }
 
       case FSM::LIFT_HOME: {
-        RCLCPP_INFO(node->get_logger(), ">> LIFT_HOME: lifting and returning home");
-
+        RCLCPP_INFO(node->get_logger(), ">> LIFT_HOME: lift and home");
         auto ee = arm.getCurrentPose().pose;
+
         geometry_msgs::msg::Pose lift_pose = ee;
         lift_pose.position.z = clamp(lift_pose.position.z + lift_dist, z_min, z_max);
 
@@ -420,7 +447,7 @@ int main(int argc, char** argv) {
         arm.setNamedTarget("home");
         arm.move();
 
-        stable_count = 0;
+        center_count = 0;
         fail_count = 0;
         state = FSM::WAIT_MARKER;
         break;
