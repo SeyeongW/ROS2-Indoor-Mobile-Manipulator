@@ -1,3 +1,11 @@
+// real_pick_node.cpp
+// OpenManipulator-X: WAIT (no sweep) + pick closest visible ArUco marker
+//  - Subscribes /aruco/markers to choose closest (min z) marker id
+//  - Uses TF (link1 -> aruco_marker_<id>) and a 2-stage approach:
+//      1) XY_ALIGN at fixed z_safe
+//      2) DESCEND in steps to z_final
+//  - Avoids target_z = mz + hover_offset (bad when camera is on end-effector)
+
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
@@ -23,11 +31,16 @@ using namespace std::chrono_literals;
 using GripperCommand = control_msgs::action::GripperCommand;
 using ArucoMarkers   = ros2_aruco_interfaces::msg::ArucoMarkers;
 
-static bool isFinite(double v) { return std::isfinite(v); }
+static double clamp(double v, double lo, double hi) {
+  return std::max(lo, std::min(hi, v));
+}
+static bool isFinite(double v) {
+  return std::isfinite(v);
+}
 
-void operateGripper(rclcpp::Node::SharedPtr node,
-                    rclcpp_action::Client<GripperCommand>::SharedPtr client,
-                    double pos)
+static void operateGripper(rclcpp::Node::SharedPtr node,
+                           rclcpp_action::Client<GripperCommand>::SharedPtr client,
+                           double pos)
 {
   if (!client->wait_for_action_server(2s)) {
     RCLCPP_ERROR(node->get_logger(), "Gripper action server not available");
@@ -41,23 +54,25 @@ void operateGripper(rclcpp::Node::SharedPtr node,
 }
 
 enum class FSM {
-  WAIT,          // 가만히 대기 (마커 보이면 STABILIZE)
-  STABILIZE,     // 동일 ID를 N번 연속으로 "fresh TF"로 확인
-  APPROACH,      // step-down 접근
-  GRASP,         // 집기
-  LIFT_AND_HOME  // 들어올리고 홈
+  WAIT,          // idle at home/current pose until marker TF is fresh
+  STABILIZE,     // require N consecutive fresh TFs, median filter
+  APPROACH,      // 2-stage: XY_ALIGN then DESCEND
+  GRASP,         // close gripper
+  LIFT_AND_HOME  // lift and go home
 };
+
+enum class ApproachStage { XY_ALIGN, DESCEND };
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
 
-  auto node = std::make_shared<rclcpp::Node>("omx_real_picker_any_id_wait");
+  auto node = std::make_shared<rclcpp::Node>("real_pick_node");
   auto exec = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   exec->add_node(node);
   std::thread spinner([&exec](){ exec->spin(); });
 
   // ---------------- TF ----------------
-  auto tf_buffer  = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+  auto tf_buffer   = std::make_unique<tf2_ros::Buffer>(node->get_clock());
   auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
   // --------------- MoveIt -------------
@@ -66,7 +81,7 @@ int main(int argc, char** argv) {
   arm.setMaxAccelerationScalingFactor(0.15);
   arm.setPlanningTime(5.0);
 
-  // position only
+  // position-only (4DOF)
   arm.setGoalPositionTolerance(0.03);
   arm.setGoalOrientationTolerance(3.14);
 
@@ -75,28 +90,23 @@ int main(int argc, char** argv) {
       node, "/gripper_controller/gripper_cmd");
 
   // ---------- USER SETTINGS ----------
-  std::string base_frame = "link1";          // 로봇 기준 프레임(네 환경에 맞게)
-  std::string markers_topic = "/aruco/markers";
+  std::string base_frame    = "link1";          // robot base frame used for planning targets
+  std::string markers_topic = "/aruco/markers"; // published by your aruco node
 
-  // Gripper positions (환경마다 다를 수 있음)
-  double GRIP_OPEN  = 0.019;
-  double GRIP_CLOSE = -0.001;
+  // Gripper positions (may differ by setup)
+  const double GRIP_OPEN  = 0.019;
+  const double GRIP_CLOSE = -0.001;
 
-  // APPROACH params
-  double hover_offset = 0.15;
-  double step         = 0.03;
-  double final_min_z  = 0.04;
-
-  // TF 신선도 기준 (카메라 FPS/검출 끊김 고려해서 넉넉히)
+  // TF freshness cutoff
   double max_tf_age_sec = 1.5;
 
-  // 같은 ID가 연속 N번 "fresh TF"로 잡혀야 안정화 완료
+  // Stabilization
   int stable_need = 5;
 
-  // move 실패 허용
+  // Failure handling
   int max_fail_before_wait = 3;
 
-  // filtering window (median)
+  // Filtering window (median)
   const size_t FILTER_N = 7;
   std::deque<double> fx, fy, fz;
 
@@ -108,7 +118,15 @@ int main(int argc, char** argv) {
     return tmp[tmp.size()/2];
   };
 
-  // ---------- /aruco/markers 최신값 저장 ----------
+  // ---- 2-stage approach parameters (tune here) ----
+  double final_min_z  = 0.04;  // hard floor (avoid table/ground)
+  double z_safe       = 0.25;  // stage1: XY alignment height (in base_frame)
+  double z_final      = 0.12;  // stage2: final descend height before grasp
+  double z_step_down  = 0.03;  // descend step
+  double max_xy       = 0.25;  // clamp XY to avoid unreachable goals
+  double max_z        = 0.35;  // clamp Z to avoid unreachable goals (conservative)
+
+  // ---------- /aruco/markers latest cache ----------
   std::mutex mk_mtx;
   ArucoMarkers latest_markers;
   bool have_markers = false;
@@ -122,7 +140,7 @@ int main(int argc, char** argv) {
     }
   );
 
-  // ---------- "현재 보이는 마커 중 가장 가까운 ID" 선택 ----------
+  // Choose closest marker by min pose.z in /aruco/markers (camera frame depth)
   auto selectClosestId = [&]() -> int {
     std::lock_guard<std::mutex> lk(mk_mtx);
     if (!have_markers) return -1;
@@ -144,7 +162,7 @@ int main(int argc, char** argv) {
     return best_id;
   };
 
-  // ---------- 선택된 마커 TF를 base_frame 기준으로 "fresh"하게 얻기 ----------
+  // Get fresh TF from base_frame to the marker frame
   auto getFreshMarkerTF = [&](const std::string& target_marker_frame,
                               double& ox, double& oy, double& oz) -> bool
   {
@@ -171,9 +189,11 @@ int main(int argc, char** argv) {
 
       if (!isFinite(x) || !isFinite(y) || !isFinite(z)) return false;
 
+      // median filtering
       ox = push_and_median(fx, x);
       oy = push_and_median(fy, y);
       oz = push_and_median(fz, z);
+
       return true;
     } catch (...) {
       return false;
@@ -193,27 +213,29 @@ int main(int argc, char** argv) {
   int stable_count = 0;
   int approach_fail = 0;
 
-  double current_offset = hover_offset;
-
-  // 목표 마커 ID/프레임
+  // current target marker
   int target_id = -1;
   std::string target_marker_frame;
 
-  // filtered marker pose (base_frame 기준)
+  // filtered marker pose in base_frame
   double mx=0, my=0, mz=0;
+
+  // approach sub-stage
+  ApproachStage approach_stage = ApproachStage::XY_ALIGN;
+  double current_z_cmd = z_safe;
 
   rclcpp::Rate rate(10);
 
   while (rclcpp::ok()) {
-
-    // 1) 현재 보이는 마커 중 가장 가까운 ID 선택
+    // 1) choose best marker id
     int best_id = selectClosestId();
 
-    // 2) 타겟 ID가 바뀌면 필터/카운트 리셋
+    // 2) if target changes, reset filters/stability
     if (best_id != target_id) {
       target_id = best_id;
       stable_count = 0;
       fx.clear(); fy.clear(); fz.clear();
+
       if (target_id >= 0) {
         target_marker_frame = "aruco_marker_" + std::to_string(target_id);
         RCLCPP_INFO(node->get_logger(), ">> Target marker set to ID=%d (%s)",
@@ -223,7 +245,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    // 3) target_marker_frame이 있으면 TF로 pose 얻기
+    // 3) get fresh TF for current target
     bool visible = false;
     if (!target_marker_frame.empty()) {
       visible = getFreshMarkerTF(target_marker_frame, mx, my, mz);
@@ -257,9 +279,10 @@ int main(int argc, char** argv) {
                     stable_count, stable_need, target_id, mx, my, mz);
 
         if (stable_count >= stable_need) {
-          current_offset = hover_offset;
           approach_fail = 0;
-          RCLCPP_INFO(node->get_logger(), ">> STABILIZE done. Switching to APPROACH");
+          approach_stage = ApproachStage::XY_ALIGN;
+          current_z_cmd = z_safe;
+          RCLCPP_INFO(node->get_logger(), ">> STABILIZE done. Switching to APPROACH (2-stage)");
           state = FSM::APPROACH;
         }
         break;
@@ -273,35 +296,81 @@ int main(int argc, char** argv) {
           break;
         }
 
-        double target_z = std::max(final_min_z, mz + current_offset);
+        // Clamp XY (avoid impossible goals)
+        double tx = clamp(mx, -max_xy, max_xy);
+        double ty = clamp(my, -max_xy, max_xy);
 
-        RCLCPP_INFO(node->get_logger(), ">> APPROACH ID=%d offset=%.3f target=(%.3f, %.3f, %.3f)",
-                    target_id, current_offset, mx, my, target_z);
+        // Clamp Z bounds
+        double z_safe_clamped  = clamp(z_safe,  final_min_z + 0.05, max_z);
+        double z_final_clamped = clamp(z_final, final_min_z,        z_safe_clamped);
 
-        arm.setStartStateToCurrentState();
-        arm.setPositionTarget(mx, my, target_z);
+        if (approach_stage == ApproachStage::XY_ALIGN) {
+          double tz = z_safe_clamped;
 
-        auto result = arm.move();
+          RCLCPP_INFO(node->get_logger(),
+                      ">> APPROACH[XY_ALIGN] target=(%.3f, %.3f, %.3f)", tx, ty, tz);
 
-        if (result == moveit::core::MoveItErrorCode::SUCCESS) {
-          approach_fail = 0;
-          current_offset -= step;
+          arm.setStartStateToCurrentState();
+          arm.setPositionTarget(tx, ty, tz);
 
-          if (current_offset <= 0.01) {
-            RCLCPP_INFO(node->get_logger(), ">> Reached near target. Switching to GRASP");
-            state = FSM::GRASP;
-          }
-        } else {
-          approach_fail++;
-          RCLCPP_ERROR(node->get_logger(), "Move failed (%d/%d).", approach_fail, max_fail_before_wait);
+          auto result = arm.move();
 
-          if (approach_fail >= max_fail_before_wait) {
-            RCLCPP_WARN(node->get_logger(), ">> Too many failures. Back to WAIT");
-            state = FSM::WAIT;
+          if (result == moveit::core::MoveItErrorCode::SUCCESS) {
+            approach_fail = 0;
+            approach_stage = ApproachStage::DESCEND;
+            current_z_cmd = z_safe_clamped;
+            RCLCPP_INFO(node->get_logger(), ">> XY aligned. Switching to DESCEND");
           } else {
-            current_offset = std::min(hover_offset, current_offset + 0.05);
+            approach_fail++;
+            RCLCPP_ERROR(node->get_logger(), "XY_ALIGN move failed (%d/%d).",
+                         approach_fail, max_fail_before_wait);
+
+            if (approach_fail >= max_fail_before_wait) {
+              RCLCPP_WARN(node->get_logger(), ">> Too many failures. Back to WAIT");
+              state = FSM::WAIT;
+            }
           }
+          break;
         }
+
+        if (approach_stage == ApproachStage::DESCEND) {
+          // step down toward final height
+          current_z_cmd -= z_step_down;
+          if (current_z_cmd < z_final_clamped) current_z_cmd = z_final_clamped;
+
+          double tz = current_z_cmd;
+
+          RCLCPP_INFO(node->get_logger(),
+                      ">> APPROACH[DESCEND] z=%.3f (final=%.3f) target=(%.3f, %.3f, %.3f)",
+                      tz, z_final_clamped, tx, ty, tz);
+
+          arm.setStartStateToCurrentState();
+          arm.setPositionTarget(tx, ty, tz);
+
+          auto result = arm.move();
+
+          if (result == moveit::core::MoveItErrorCode::SUCCESS) {
+            approach_fail = 0;
+            if (std::abs(current_z_cmd - z_final_clamped) < 1e-3) {
+              RCLCPP_INFO(node->get_logger(), ">> Reached final height. Switching to GRASP");
+              state = FSM::GRASP;
+            }
+          } else {
+            approach_fail++;
+            RCLCPP_ERROR(node->get_logger(), "DESCEND move failed (%d/%d).",
+                         approach_fail, max_fail_before_wait);
+
+            if (approach_fail >= max_fail_before_wait) {
+              RCLCPP_WARN(node->get_logger(), ">> Too many failures. Back to WAIT");
+              state = FSM::WAIT;
+            } else {
+              // on failure, retreat a bit upward then retry
+              current_z_cmd = std::min(z_safe_clamped, current_z_cmd + 0.05);
+            }
+          }
+          break;
+        }
+
         break;
       }
 
@@ -313,12 +382,13 @@ int main(int argc, char** argv) {
       }
 
       case FSM::LIFT_AND_HOME: {
-        // lift는 마지막 mx,my,mz 기준
-        double lift_z = std::max(final_min_z + 0.10, mz + hover_offset);
+        // Lift to safe height (do NOT use mz+offset; camera-on-EE makes that unstable)
+        double lift_z = clamp(z_safe, final_min_z + 0.10, max_z);
+
         RCLCPP_INFO(node->get_logger(), ">> LIFT to z=%.3f then HOME", lift_z);
 
         arm.setStartStateToCurrentState();
-        arm.setPositionTarget(mx, my, lift_z);
+        arm.setPositionTarget(clamp(mx, -max_xy, max_xy), clamp(my, -max_xy, max_xy), lift_z);
         arm.move();
 
         arm.setNamedTarget("home");
