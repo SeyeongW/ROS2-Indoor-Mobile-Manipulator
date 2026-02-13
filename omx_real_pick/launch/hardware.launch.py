@@ -26,23 +26,9 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="false"),
         DeclareLaunchArgument("marker_size", default_value="0.06"),
         DeclareLaunchArgument("camera_frame", default_value="camera_link"),
-        # ✅ 너 환경 기준 토픽 기본값 (필요하면 실행 시 덮어쓰기)
         DeclareLaunchArgument("image_topic", default_value="/camera/camera/color/image_raw"),
         DeclareLaunchArgument("camera_info_topic", default_value="/camera/camera/color/camera_info"),
     ]
-
-    # -----------------------
-    # 1) OpenManipulator X Hardware driver (U2D2)
-    # -----------------------
-    omx_hw_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(
-                get_package_share_directory("open_manipulator_x_bringup"),
-                "launch",
-                "hardware.launch.py",
-            )
-        )
-    )
 
     # -----------------------
     # 2) MoveIt move_group

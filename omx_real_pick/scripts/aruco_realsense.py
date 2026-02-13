@@ -48,9 +48,6 @@ class ArucoSubscriberNode(Node):
     def __init__(self):
         super().__init__("aruco_subscriber_node")
 
-        # ✅ use_sim_time은 강제로 set 하지 말고, launch/param에서 결정하게 둠
-        self.declare_parameter("use_sim_time", False)
-
         # Parameters
         self.declare_parameter("marker_size", 0.06)
         self.declare_parameter("frame_id", "camera_link")  # 가능하면 camera optical frame 권장
