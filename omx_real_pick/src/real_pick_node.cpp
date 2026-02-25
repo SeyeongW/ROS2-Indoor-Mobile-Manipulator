@@ -515,7 +515,7 @@ int main(int argc, char** argv) {
         const double j1_before = joints[0];
         const double j2_before = joints[1];
 
-        double dyaw   = clamp(K_yaw   * yaw_err,   -max_step_rad, max_step_rad);
+        double dyaw   = clamp(-K_yaw   * yaw_err,   -max_step_rad, max_step_rad);
         double dpitch = clamp(-K_pitch * pitch_err, -max_step_rad, max_step_rad);
 
         joints[0] = clamp(joints[0] + dyaw,   j1_min, j1_max);
