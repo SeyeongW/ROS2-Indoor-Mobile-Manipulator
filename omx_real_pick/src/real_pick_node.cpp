@@ -129,7 +129,7 @@ int main(int argc, char** argv) {
       node, "/gripper_controller/gripper_cmd");
 
   const double GRIP_OPEN  = 0.019;
-  const double GRIP_CLOSE = -0.01;
+  const double GRIP_CLOSE = 0.0;
 
   // TF freshness
   const double max_tf_age_sec = 1.0;
