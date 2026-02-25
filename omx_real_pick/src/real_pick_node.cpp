@@ -341,7 +341,6 @@ int main(int argc, char** argv) {
                       d, grip_close_dist_m);
           state = FSM::GRASP;
           break;
-          center_count = center_need;
         }
             
 
@@ -404,6 +403,8 @@ int main(int argc, char** argv) {
 
           state = FSM::PREGRASP;
           break;
+
+          center_count = center_need;
         }
 
         std::vector<double> joints = arm.getCurrentJointValues();
