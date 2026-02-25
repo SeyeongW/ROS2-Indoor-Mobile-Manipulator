@@ -160,8 +160,9 @@ int main(int argc, char** argv) {
   const double min_cart_frac = 0.85;
 
   const double grasp_pos_tol = 0.03;
-  const double grip_close_dist_m = 0.20;  // Close gripper when marker is within 10 cm in camera frame.
-  const double center_cmd_interval_sec = 0.35;  // Limit centering command updates to reduce oscillation.
+  const double grip_close_dist_m = 0.10;  // Close gripper when EE-to-marker distance is within 10 cm.
+  const double close_align_tol_rad = 5.0 * M_PI / 180.0;  // Slightly relaxed alignment tolerance for grasp trigger.
+  const double center_cmd_interval_sec = 0.20;  // Limit centering command updates to reduce oscillation.
 
   const double z_min  = 0.05;
   const double z_max  = 0.35;
@@ -327,27 +328,65 @@ int main(int argc, char** argv) {
           break;
         }
 
+        geometry_msgs::msg::TransformStamped t_base_marker;
+        if (!getFreshTF(base_frame, target_frame, t_base_marker)) {
+          center_count = 0;
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
         const double x = t_cam_marker.transform.translation.x;
         const double y = t_cam_marker.transform.translation.y;
         const double z = t_cam_marker.transform.translation.z;
 
-        // [ADDED] camera 기준 마커 xyz + 거리 로그
-        const double d = distXYZ(x, y, z);
-        RCLCPP_INFO(node->get_logger(),
-                    ">> MARKER (camera->%s): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
-                    target_frame.c_str(), x, y, z, d);
-
+        const double cam_dist = distXYZ(x, y, z);
         const double yaw_err   = std::atan2(x, z);
         const double pitch_err = std::atan2(-y, z);
 
-        if (d <= grip_close_dist_m &&
-            std::abs(yaw_err) < yaw_tol_rad &&
-            std::abs(pitch_err) < pitch_tol_rad) {
+        const auto ee_now = arm.getCurrentPose().pose;
+        geometry_msgs::msg::Point mk_base;
+        mk_base.x = t_base_marker.transform.translation.x;
+        mk_base.y = t_base_marker.transform.translation.y;
+        mk_base.z = t_base_marker.transform.translation.z;
+        const double ee_marker_dist = dist3(ee_now.position, mk_base);
+
+        RCLCPP_INFO(node->get_logger(),
+                    ">> MARKER cam_xyz=(%.3f, %.3f, %.3f) cam_dist=%.3f m ee_dist=%.3f m",
+                    x, y, z, cam_dist, ee_marker_dist);
+
+        const bool center_aligned =
+            (std::abs(yaw_err) < yaw_tol_rad && std::abs(pitch_err) < pitch_tol_rad);
+
+        if (center_aligned) {
+          center_count++;
+          RCLCPP_INFO(node->get_logger(), ">> CENTER OK %d/%d", center_count, center_need);
+        } else {
+          center_count = 0;
+        }
+
+        // Use EE-to-marker distance (not camera-to-marker distance) for grasp transition.
+        if (ee_marker_dist <= grip_close_dist_m &&
+            std::abs(yaw_err) < close_align_tol_rad &&
+            std::abs(pitch_err) < close_align_tol_rad) {
+          latch_x = mk_base.x;
+          latch_y = mk_base.y;
+          have_latch = true;
+
+          pregrasp_pose.position.x = clamp(latch_x + pregrasp_dx, -xy_max, xy_max);
+          pregrasp_pose.position.y = clamp(latch_y, -xy_max, xy_max);
+          pregrasp_pose.position.z = clamp(z_work, z_min, z_max);
+
+          final_pose.position.x = clamp(latch_x + final_dx, -xy_max, xy_max);
+          final_pose.position.y = clamp(latch_y, -xy_max, xy_max);
+          final_pose.position.z = clamp(z_work, z_min, z_max);
+
+          pregrasp_pose.orientation = ee_now.orientation;
+          final_pose.orientation = ee_now.orientation;
+
           RCLCPP_INFO(node->get_logger(),
-                      ">> CLOSE CONDITION: dist=%.3f <= %.3f and aligned (yaw=%.2fdeg pitch=%.2fdeg)",
-                      d, grip_close_dist_m,
-                      yaw_err * 180.0 / M_PI, pitch_err * 180.0 / M_PI);
-          state = FSM::GRASP;
+                      ">> GRASP READY: ee_dist=%.3f <= %.3f, move PREGRASP",
+                      ee_marker_dist, grip_close_dist_m);
+          state = FSM::PREGRASP;
           break;
         }
 
@@ -355,17 +394,9 @@ int main(int argc, char** argv) {
                     ">> CENTER: yaw_err=%.2fdeg pitch_err=%.2fdeg (x=%.3f y=%.3f z=%.3f)",
                     yaw_err * 180.0 / M_PI, pitch_err * 180.0 / M_PI, x, y, z);
 
-        if (std::abs(yaw_err) < yaw_tol_rad && std::abs(pitch_err) < pitch_tol_rad) {
-          center_count++;
-          RCLCPP_INFO(node->get_logger(), ">> CENTER OK %d/%d", center_count, center_need);
-        } else {
-          center_count = 0;
-        }
-
+        // When already well centered, avoid issuing more joint goals to reduce jitter.
         if (center_count >= center_need) {
-          // Keep tracking marker center continuously.
-          // Gripper closure is triggered only by distance threshold above.
-          center_count = center_need;
+          break;
         }
 
         std::vector<double> joints = arm.getCurrentJointValues();
@@ -383,7 +414,7 @@ int main(int argc, char** argv) {
         pitch_cmd_sign = (pitch_cmd_sign >= 0) ? 1 : -1;
 
         double dyaw   = clamp(yaw_cmd_sign * K_yaw * yaw_err,   -max_step_rad, max_step_rad);
-        double dpitch = clamp(-pitch_cmd_sign * K_pitch * pitch_err, -max_step_rad, max_step_rad);
+        double dpitch = clamp(pitch_cmd_sign * K_pitch * pitch_err, -max_step_rad, max_step_rad);
 
         RCLCPP_DEBUG(node->get_logger(),
                      ">> CTRL: yaw_cmd_sign=%d pitch_cmd_sign=%d dyaw=%.4f dpitch=%.4f",
@@ -486,7 +517,14 @@ int main(int argc, char** argv) {
 
       case FSM::GRASP: {
         RCLCPP_INFO(node->get_logger(), ">> GRASP: close gripper NOW");
-        operateGripper(node, gripper, GRIP_CLOSE, 10.0);
+        const bool grasp_ok = operateGripper(node, gripper, GRIP_CLOSE, 10.0);
+        if (!grasp_ok) {
+          fail_count++;
+          RCLCPP_ERROR(node->get_logger(), ">> GRASP failed (%d/%d)", fail_count, max_fail);
+          if (fail_count >= max_fail) state = FSM::HOME_INIT;
+          else state = FSM::WAIT_MARKER;
+          break;
+        }
         state = FSM::LIFT_HOME;
         break;
       }
