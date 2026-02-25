@@ -330,7 +330,7 @@ int main(int argc, char** argv) {
                     target_frame.c_str(), x, y, z, d);
 
         const double yaw_err   = std::atan2(x, z);
-        const double pitch_err = std::atan2(y, z);
+        const double pitch_err = std::atan2(-y, z);
 
         RCLCPP_INFO(node->get_logger(),
                     ">> CENTER: yaw_err=%.2fdeg pitch_err=%.2fdeg (x=%.3f y=%.3f z=%.3f)",
