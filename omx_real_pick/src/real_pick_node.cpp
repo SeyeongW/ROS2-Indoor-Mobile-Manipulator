@@ -20,6 +20,7 @@
 #include <cmath>
 #include <string>
 #include <future>
+#include <deque>
 
 using namespace std::chrono_literals;
 
@@ -38,9 +39,20 @@ static double dist3(const geometry_msgs::msg::Point& a, const geometry_msgs::msg
   return std::sqrt(dx*dx + dy*dy + dz*dz);
 }
 
-// [ADDED] xyz 기반 거리
+// xyz 기반 거리
 static double distXYZ(double x, double y, double z) {
   return std::sqrt(x*x + y*y + z*z);
+}
+
+// ------------------------------
+// [ADDED] median filter util
+// ------------------------------
+static double medianPush(std::deque<double>& dq, double v, size_t N){
+  dq.push_back(v);
+  if (dq.size() > N) dq.pop_front();
+  std::vector<double> tmp(dq.begin(), dq.end());
+  std::sort(tmp.begin(), tmp.end());
+  return tmp[tmp.size()/2];
 }
 
 static bool operateGripper(rclcpp::Node::SharedPtr node,
@@ -105,13 +117,17 @@ int main(int argc, char** argv) {
   exec->add_node(node);
   std::thread spinner([&exec](){ exec->spin(); });
 
-  auto tf_buffer  = std::make_unique<tf2_ros::Buffer>(node->get_clock());
+  auto tf_buffer   = std::make_unique<tf2_ros::Buffer>(node->get_clock());
   auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
   moveit::planning_interface::MoveGroupInterface arm(node, "arm");
 
-  const std::string base_frame    = "link1";
-  const std::string camera_frame  = "camera_link";
+  const std::string base_frame = "link1";
+
+  // [CHANGED] optical frame 우선 사용 (없으면 camera_link로 fallback)
+  const std::string camera_frame_optical = "camera_color_optical_frame";
+  const std::string camera_frame_link    = "camera_link";
+
   const std::string markers_topic = "/aruco/markers";
 
   arm.setPoseReferenceFrame(base_frame);
@@ -221,6 +237,21 @@ int main(int argc, char** argv) {
     }
   };
 
+  // [ADDED] optical 우선, 실패하면 camera_link로
+  auto getFreshTF_Camera = [&](const std::string& marker_frame,
+                               geometry_msgs::msg::TransformStamped& out,
+                               std::string& used_cam_frame) -> bool
+  {
+    if (getFreshTF(camera_frame_optical, marker_frame, out)) {
+      used_cam_frame = camera_frame_optical;
+      return true;
+    }
+    if (getFreshTF(camera_frame_link, marker_frame, out)) {
+      used_cam_frame = camera_frame_link;
+      return true;
+    }
+    return false;
+  };
 
   FSM state = FSM::HOME_INIT;
 
@@ -234,6 +265,10 @@ int main(int argc, char** argv) {
 
   double latch_x = 0.0, latch_y = 0.0;
   bool have_latch = false;
+
+  // [ADDED] 센터링 안정화용 median window
+  std::deque<double> fx, fy, fz;
+  const size_t FILT_N = 5;
 
   rclcpp::Rate rate(10);
 
@@ -255,6 +290,8 @@ int main(int argc, char** argv) {
         opened_on_detect = false;
         have_latch = false;
 
+        fx.clear(); fy.clear(); fz.clear();
+
         state = FSM::WAIT_MARKER;
         break;
       }
@@ -275,25 +312,28 @@ int main(int argc, char** argv) {
           center_count = 0;
           opened_on_detect = false;
           have_latch = false;
+
+          fx.clear(); fy.clear(); fz.clear();
+
           RCLCPP_INFO(node->get_logger(), ">> Target marker set to ID=%d (%s)",
                       target_id, target_frame.c_str());
         }
 
         geometry_msgs::msg::TransformStamped t_cam_marker;
-        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+        std::string used_cam;
+        if (!getFreshTF_Camera(target_frame, t_cam_marker, used_cam)) {
           center_count = 0;
           break;
         }
 
-        // [ADDED] camera 기준 마커 xyz + 거리 로그
         {
           const double mx = t_cam_marker.transform.translation.x;
           const double my = t_cam_marker.transform.translation.y;
           const double mz = t_cam_marker.transform.translation.z;
           const double md = distXYZ(mx, my, mz);
           RCLCPP_INFO(node->get_logger(),
-                      ">> MARKER (camera->%s): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
-                      target_frame.c_str(), mx, my, mz, md);
+                      ">> MARKER (%s->%s): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
+                      used_cam.c_str(), target_frame.c_str(), mx, my, mz, md);
         }
 
         if (!opened_on_detect) {
@@ -313,24 +353,33 @@ int main(int argc, char** argv) {
         }
 
         geometry_msgs::msg::TransformStamped t_cam_marker;
-        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+        std::string used_cam;
+        if (!getFreshTF_Camera(target_frame, t_cam_marker, used_cam)) {
           center_count = 0;
           state = FSM::WAIT_MARKER;
           break;
         }
 
-        const double x = t_cam_marker.transform.translation.x;
-        const double y = t_cam_marker.transform.translation.y;
-        const double z = t_cam_marker.transform.translation.z;
+        // raw
+        double x = t_cam_marker.transform.translation.x;
+        double y = t_cam_marker.transform.translation.y;
+        double z = t_cam_marker.transform.translation.z;
 
-        // [ADDED] camera 기준 마커 xyz + 거리 로그
+        // [ADDED] median filtering to reduce depth/pose jitter
+        x = medianPush(fx, x, FILT_N);
+        y = medianPush(fy, y, FILT_N);
+        z = medianPush(fz, z, FILT_N);
+
         const double d = distXYZ(x, y, z);
         RCLCPP_INFO(node->get_logger(),
-                    ">> MARKER (camera->%s): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
-                    target_frame.c_str(), x, y, z, d);
+                    ">> MARKER_FILT (%s->%s): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
+                    used_cam.c_str(), target_frame.c_str(), x, y, z, d);
 
+        // [CHANGED] optical frame 축 가정에 맞춤:
+        // optical: x=right, y=down, z=forward
+        // center 오차는 화면 중앙(0,0)을 향하도록 yaw/pitch를 줄이는 방향
         const double yaw_err   = std::atan2(x, z);
-        const double pitch_err = std::atan2(-y, z);
+        const double pitch_err = std::atan2(y, z);
 
         RCLCPP_INFO(node->get_logger(),
                     ">> CENTER: yaw_err=%.2fdeg pitch_err=%.2fdeg (x=%.3f y=%.3f z=%.3f)",
@@ -351,7 +400,6 @@ int main(int argc, char** argv) {
             break;
           }
 
-          // [ADDED] base(link1) 기준 마커 xyz + 거리 로그
           {
             const double bx = t_base_marker.transform.translation.x;
             const double by = t_base_marker.transform.translation.y;
@@ -396,6 +444,7 @@ int main(int argc, char** argv) {
           break;
         }
 
+        // [CHANGED] 오차를 줄이는 방향으로 joint update (부호는 위에서 바로잡았음)
         double dyaw   = clamp(-K_yaw   * yaw_err,   -max_step_rad, max_step_rad);
         double dpitch = clamp(-K_pitch * pitch_err, -max_step_rad, max_step_rad);
 
@@ -513,6 +562,9 @@ int main(int argc, char** argv) {
         fail_count = 0;
         opened_on_detect = false;
         have_latch = false;
+
+        fx.clear(); fy.clear(); fz.clear();
+
         state = FSM::WAIT_MARKER;
         break;
       }
