@@ -160,6 +160,7 @@ int main(int argc, char** argv) {
   const double min_cart_frac = 0.85;
 
   const double grasp_pos_tol = 0.03;
+  const double grip_close_dist_m = 0.10;
 
   const double z_min  = 0.05;
   const double z_max  = 0.35;
@@ -334,6 +335,16 @@ int main(int argc, char** argv) {
                     ">> MARKER (camera->%s): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
                     target_frame.c_str(), x, y, z, d);
 
+        if (d <= grip_close_dist_m) {
+          RCLCPP_INFO(node->get_logger(),
+                      ">> CLOSE CONDITION: marker distance %.3f m <= %.3f m",
+                      d, grip_close_dist_m);
+          state = FSM::GRASP;
+          break;
+          center_count = center_need;
+        }
+            
+
         const double yaw_err   = std::atan2(x, z);
         const double pitch_err = std::atan2(-y, z);
 
@@ -410,7 +421,7 @@ int main(int argc, char** argv) {
         pitch_cmd_sign = (pitch_cmd_sign >= 0) ? 1 : -1;
 
         double dyaw   = clamp(yaw_cmd_sign * K_yaw * yaw_err,   -max_step_rad, max_step_rad);
-        double dpitch = clamp(pitch_cmd_sign * K_pitch * pitch_err, -max_step_rad, max_step_rad);
+        double dpitch = clamp(-pitch_cmd_sign * K_pitch * pitch_err, -max_step_rad, max_step_rad);
 
         RCLCPP_DEBUG(node->get_logger(),
                      ">> CTRL: yaw_cmd_sign=%d pitch_cmd_sign=%d dyaw=%.4f dpitch=%.4f",
