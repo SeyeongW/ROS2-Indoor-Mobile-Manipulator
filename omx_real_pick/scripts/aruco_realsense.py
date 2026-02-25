@@ -53,10 +53,11 @@ class ArucoSubscriberNode(Node):
         self.declare_parameter("image_topic", "/camera/camera/color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/camera/color/camera_info")
 
-        # ✅ depth (aligned)
+        # depth (aligned)
         self.declare_parameter("depth_topic", "/camera/camera/aligned_depth_to_color/image_raw")
         self.declare_parameter("depth_unit_scale", 0.001)  # 16UC1(mm) -> m
-        self.declare_parameter("depth_median_ksize", 3)    # 3 or 5 권장
+        self.declare_parameter("depth_median_ksize", 7)     # ✅ 3보다 5~7이 안정적
+        self.declare_parameter("depth_use_bbox_roi", True)  # ✅ 바운딩박스 ROI 기반 depth 사용
 
         self.marker_size = float(self.get_parameter("marker_size").value)
         self.base_frame_id = str(self.get_parameter("frame_id").value)
@@ -65,6 +66,7 @@ class ArucoSubscriberNode(Node):
         self.depth_topic = str(self.get_parameter("depth_topic").value)
         self.depth_unit_scale = float(self.get_parameter("depth_unit_scale").value)
         self.depth_median_ksize = int(self.get_parameter("depth_median_ksize").value)
+        self.depth_use_bbox_roi = bool(self.get_parameter("depth_use_bbox_roi").value)
 
         # ArUco dictionaries
         self.dict_collection = {
@@ -80,7 +82,7 @@ class ArucoSubscriberNode(Node):
             det = aruco.ArucoDetector(d, p)
             self.detectors.append((name, det))
 
-        # Marker object points
+        # Marker object points (meters)
         ms_half = self.marker_size / 2.0
         self.marker_obj_points = np.array([
             [-ms_half,  ms_half, 0.0],
@@ -115,7 +117,8 @@ class ArucoSubscriberNode(Node):
             f"  color={self.image_topic}\n"
             f"  info ={self.info_topic}\n"
             f"  depth={self.depth_topic}\n"
-            f"  frame_id(param)='{self.base_frame_id}' (empty => use msg.header.frame_id)"
+            f"  frame_id(param)='{self.base_frame_id}' (empty => use msg.header.frame_id)\n"
+            f"  depth_use_bbox_roi={self.depth_use_bbox_roi}, depth_median_ksize={self.depth_median_ksize}"
         )
 
     def camera_info_callback(self, msg: CameraInfo):
@@ -133,9 +136,7 @@ class ArucoSubscriberNode(Node):
         self.get_logger().info("✅ CameraInfo received. Using real intrinsics.")
 
     def depth_callback(self, msg: Image):
-        # depth는 16UC1(mm)인 경우가 일반적
         try:
-            # encoding을 강제하지 않고 그대로 받기 (16UC1)
             depth = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
             if depth is None:
                 return
@@ -144,7 +145,32 @@ class ArucoSubscriberNode(Node):
         except Exception as e:
             self.get_logger().error(f"Depth conversion failed: {e}")
 
+    def _depth_median_roi(self, u0: int, v0: int, u1: int, v1: int):
+        """ROI median depth (mm->m). Removes 0/NaN."""
+        if self.latest_depth is None:
+            return None
+
+        h, w = self.latest_depth.shape[:2]
+        u0 = int(max(0, min(w - 1, u0)))
+        u1 = int(max(0, min(w - 1, u1)))
+        v0 = int(max(0, min(h - 1, v0)))
+        v1 = int(max(0, min(h - 1, v1)))
+
+        if u1 < u0 or v1 < v0:
+            return None
+
+        roi = self.latest_depth[v0:v1+1, u0:u1+1].astype(np.float32)
+
+        roi = roi[np.isfinite(roi)]
+        roi = roi[roi > 0.0]  # 0=invalid
+        if roi.size == 0:
+            return None
+
+        d_raw = float(np.median(roi))
+        return d_raw * self.depth_unit_scale
+
     def _depth_median_at(self, u: int, v: int):
+        """(u,v) 주변 ksize x ksize median"""
         if self.latest_depth is None:
             return None
 
@@ -161,17 +187,35 @@ class ArucoSubscriberNode(Node):
         v0 = max(0, v - r)
         v1 = min(h - 1, v + r)
 
-        roi = self.latest_depth[v0:v1+1, u0:u1+1].astype(np.float32)
+        return self._depth_median_roi(u0, v0, u1, v1)
 
-        # 0(무효), NaN 제거
-        roi = roi[np.isfinite(roi)]
-        roi = roi[roi > 0.0]
-        if roi.size == 0:
+    def _depth_from_marker_bbox(self, corners_4x2: np.ndarray):
+        """
+        마커 코너 4점으로 만든 바운딩박스 ROI에서 median depth.
+        중앙 1픽셀보다 훨씬 안정적.
+        """
+        if self.latest_depth is None:
             return None
 
-        d_raw = float(np.median(roi))
-        d_m = d_raw * self.depth_unit_scale
-        return d_m
+        c = corners_4x2
+        u0 = int(np.floor(np.min(c[:, 0])))
+        u1 = int(np.ceil (np.max(c[:, 0])))
+        v0 = int(np.floor(np.min(c[:, 1])))
+        v1 = int(np.ceil (np.max(c[:, 1])))
+
+        # 바운딩박스 가장자리(검은 테두리/홀) 영향 줄이기 위해 살짝 안쪽으로 shrink
+        shrink = 2
+        u0 += shrink; v0 += shrink
+        u1 -= shrink; v1 -= shrink
+
+        # 너무 작아지면 fallback
+        if u1 - u0 < 2 or v1 - v0 < 2:
+            # center fallback
+            u = int(np.mean(c[:, 0]))
+            v = int(np.mean(c[:, 1]))
+            return self._depth_median_at(u, v)
+
+        return self._depth_median_roi(u0, v0, u1, v1)
 
     def image_callback(self, msg: Image):
         if self.camera_matrix is None or self.dist_coeffs is None:
@@ -190,7 +234,6 @@ class ArucoSubscriberNode(Node):
         marker_msg = ArucoMarkers()
         marker_msg.header = msg.header
 
-        # parent frame: param이 비었으면 이미지 frame_id 사용
         parent_frame = self.base_frame_id.strip() if self.base_frame_id.strip() else msg.header.frame_id
         if not parent_frame:
             parent_frame = "camera_link"
@@ -213,15 +256,18 @@ class ArucoSubscriberNode(Node):
             for i in range(len(ids)):
                 current_id = int(ids[i][0])
 
-                # 마커 중심 픽셀 (u,v)
-                c = corners[i][0]  # (4,2)
-                u = int(np.mean(c[:, 0]))
-                v = int(np.mean(c[:, 1]))
+                # corners: usually (1,4,2) -> take [0] to get (4,2)
+                c4 = corners[i][0].astype(np.float32)  # (4,2)
+
+                # 중심 픽셀
+                u = int(np.mean(c4[:, 0]))
+                v = int(np.mean(c4[:, 1]))
 
                 # 1) rotation은 solvePnP로 구함
+                # ✅ FIX: corners[i][0] 사용 (shape 안정)
                 ok, rvec, tvec = cv2.solvePnP(
                     self.marker_obj_points,
-                    corners[i],
+                    c4,  # ✅ 여기
                     self.camera_matrix,
                     self.dist_coeffs,
                     flags=cv2.SOLVEPNP_IPPE_SQUARE
@@ -233,7 +279,11 @@ class ArucoSubscriberNode(Node):
                 qx, qy, qz, qw = rotation_matrix_to_quaternion(rmat)
 
                 # 2) translation은 depth 기반으로 (X,Y,Z)
-                d_m = self._depth_median_at(u, v)
+                if self.depth_use_bbox_roi:
+                    d_m = self._depth_from_marker_bbox(c4)
+                else:
+                    d_m = self._depth_median_at(u, v)
+
                 if d_m is None or not np.isfinite(d_m) or d_m <= 0.02 or d_m > 2.0:
                     # depth가 없으면 solvePnP translation fallback
                     px = float(tvec[0][0])
@@ -247,7 +297,8 @@ class ArucoSubscriberNode(Node):
                     pz = d_m
                     use_depth = True
 
-                # publish /aruco/markers
+                dist = float(np.sqrt(px*px + py*py + pz*pz))
+
                 marker_msg.marker_ids.append(current_id)
 
                 pose = Pose()
@@ -272,9 +323,9 @@ class ArucoSubscriberNode(Node):
                 self.tf_broadcaster.sendTransform(t)
 
                 # overlay
-                text_pos = (int(c[0][0]), int(c[0][1]) - 10)
+                text_pos = (int(c4[0][0]), int(c4[0][1]) - 10)
                 src = "D" if use_depth else "PnP"
-                info_text = f"ID:{current_id}({name}) {src} z:{pz:.2f}"
+                info_text = f"ID:{current_id}({name}) {src} z:{pz:.2f} d:{dist:.2f}"
                 cv2.putText(vis_frame, info_text, text_pos,
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
