@@ -1,4 +1,3 @@
-// omx_real_picker_tf_only.cpp
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
@@ -13,24 +12,20 @@
 
 #include <chrono>
 #include <cmath>
-#include <deque>
-#include <vector>
-#include <algorithm>
-#include <future>
 #include <thread>
+#include <future>
+#include <vector>
+#include <string>
+#include <algorithm>
 
 using namespace std::chrono_literals;
 using GripperCommand = control_msgs::action::GripperCommand;
 
-static bool isFinite(double v){ return std::isfinite(v); }
-
-static double medianPush(std::deque<double>& dq, double v, size_t N){
-  dq.push_back(v);
-  if(dq.size() > N) dq.pop_front();
-  std::vector<double> tmp(dq.begin(), dq.end());
-  std::sort(tmp.begin(), tmp.end());
-  return tmp[tmp.size()/2];
+static double clamp(double v, double lo, double hi){
+  return std::max(lo, std::min(hi, v));
 }
+
+static bool isFinite(double v){ return std::isfinite(v); }
 
 static bool operateGripperBlocking(
   rclcpp::Node::SharedPtr node,
@@ -69,13 +64,20 @@ static bool operateGripperBlocking(
   return true;
 }
 
-enum class FSM { SEARCH, STABILIZE, APPROACH, GRASP, LIFT_AND_HOME };
+enum class FSM { HOME, TRACK, GRASP, DONE };
+
+static int find_index(const std::vector<std::string>& names, const std::string& key){
+  for(size_t i=0;i<names.size();++i){
+    if(names[i] == key) return static_cast<int>(i);
+  }
+  return -1;
+}
 
 int main(int argc, char** argv){
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<rclcpp::Node>("omx_real_picker_tf_only");
+  auto node = std::make_shared<rclcpp::Node>("omx_track_and_grasp");
 
-  // Executor (필수: TF/Action 콜백 안정)
+  // Executor (TF/action 콜백 안정)
   auto exec = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
   exec->add_node(node);
   std::thread spinner([&](){ exec->spin(); });
@@ -86,20 +88,15 @@ int main(int argc, char** argv){
 
   // MoveIt
   moveit::planning_interface::MoveGroupInterface arm(node, "arm");
-  arm.setMaxVelocityScalingFactor(0.15);
-  arm.setMaxAccelerationScalingFactor(0.15);
-  arm.setPlanningTime(5.0);
-  arm.setGoalPositionTolerance(0.02);   // 조금 타이트하게
+  arm.setMaxVelocityScalingFactor(0.25);
+  arm.setMaxAccelerationScalingFactor(0.25);
+  arm.setPlanningTime(2.0);
+  arm.setGoalPositionTolerance(0.02);
   arm.setGoalOrientationTolerance(3.14);
 
-  // Frames
-  std::string base_frame   = node->declare_parameter<std::string>("base_frame", "link1");
+  // Frames / marker
+  std::string camera_frame = node->declare_parameter<std::string>("camera_frame", "camera_color_optical_frame");
   std::string marker_frame = node->declare_parameter<std::string>("marker_frame", "aruco_marker_23");
-
-  arm.setPoseReferenceFrame(base_frame);
-  RCLCPP_INFO(node->get_logger(), "Planning frame: %s", arm.getPlanningFrame().c_str());
-  RCLCPP_INFO(node->get_logger(), "Pose reference frame: %s", base_frame.c_str());
-  RCLCPP_INFO(node->get_logger(), "Marker frame: %s", marker_frame.c_str());
 
   // Gripper
   auto gripper = rclcpp_action::create_client<GripperCommand>(node, "/gripper_controller/gripper_cmd");
@@ -107,159 +104,181 @@ int main(int argc, char** argv){
   double GRIP_CLOSE  = node->declare_parameter<double>("grip_close", 0.0);
   double GRIP_EFFORT = node->declare_parameter<double>("grip_effort", 0.2);
 
-  // SEARCH waypoints
-  std::vector<std::vector<double>> waypoints = {
-    { 0.00, -0.20,  0.20,  0.80},
-    { 1.00, -0.20,  0.20,  0.80},
-    {-1.00, -0.20,  0.20,  0.80},
-    { 0.00, -0.60,  0.30,  1.20}
-  };
+  // Tracking gains / limits
+  double K_yaw   = node->declare_parameter<double>("K_yaw", 0.6);
+  double K_pitch = node->declare_parameter<double>("K_pitch", 0.6);
+  double K_forward = node->declare_parameter<double>("K_forward", 0.4); // 접근용(관절3)
+
+  double max_step_rad = node->declare_parameter<double>("max_step_rad", 0.08);
+
+  // Center tolerance
+  double yaw_tol_deg   = node->declare_parameter<double>("yaw_tol_deg", 4.0);
+  double pitch_tol_deg = node->declare_parameter<double>("pitch_tol_deg", 4.0);
+  double yaw_tol   = yaw_tol_deg   * M_PI / 180.0;
+  double pitch_tol = pitch_tol_deg * M_PI / 180.0;
+
+  // Distance gating for grasp
+  double camera_to_grip = node->declare_parameter<double>("camera_to_grip", 0.08); // 카메라->그리퍼 끝 대략(미터)
+  double grasp_distance = node->declare_parameter<double>("grasp_distance", 0.02); // 그리퍼 끝이 마커까지 2cm 남기고 닫기
+  double grasp_tol      = node->declare_parameter<double>("grasp_tol", 0.02);      // ±2cm 허용
+  int    grasp_need     = node->declare_parameter<int>("grasp_need", 5);           // N회 연속 만족 시 닫기
 
   // TF freshness
-  double max_tf_age_sec = node->declare_parameter<double>("max_tf_age_sec", 1.0);
-  int stable_need       = node->declare_parameter<int>("stable_need", 5);
+  double max_tf_age_sec = node->declare_parameter<double>("max_tf_age_sec", 0.7);
 
-  // Safety clamp (오프셋 아님: 로봇이 갈 수 없는 목표를 걸러주는 안전장치)
-  double min_z = node->declare_parameter<double>("min_z", 0.02);
-  double max_z = node->declare_parameter<double>("max_z", 0.40);
-  double max_xy = node->declare_parameter<double>("max_xy", 0.35);
+  // Command rate limit (preempt 방지)
+  double cmd_hz = node->declare_parameter<double>("cmd_hz", 2.0); // 2Hz만 명령
+  rclcpp::Duration cmd_period = rclcpp::Duration::from_seconds(1.0 / std::max(0.2, cmd_hz));
+  rclcpp::Time last_cmd_time(0,0,RCL_ROS_TIME);
 
-  const size_t FILTER_N = 7;
-  std::deque<double> fx, fy, fz;
+  // Joint mapping
+  auto joint_names = arm.getJointNames();
+  int idx_j1 = find_index(joint_names, "joint1");
+  int idx_j2 = find_index(joint_names, "joint2");
+  int idx_j3 = find_index(joint_names, "joint3");
+  int idx_j4 = find_index(joint_names, "joint4");
+  if(idx_j1 < 0 || idx_j2 < 0 || idx_j3 < 0){
+    RCLCPP_ERROR(node->get_logger(), "Joint names not found in MoveIt group. Got names:");
+    for(auto &n: joint_names) RCLCPP_ERROR(node->get_logger(), "  %s", n.c_str());
+    rclcpp::shutdown();
+    exec->cancel();
+    spinner.join();
+    return 1;
+  }
 
-  // init
-  RCLCPP_INFO(node->get_logger(), ">> HOME");
-  arm.setNamedTarget("home");
-  arm.move();
-  rclcpp::sleep_for(600ms);
+  // Init
+  FSM state = FSM::HOME;
+  int grasp_ok_count = 0;
 
-  (void)operateGripperBlocking(node, gripper, GRIP_OPEN, GRIP_EFFORT);
-
-  FSM state = FSM::SEARCH;
-  int wp_idx = 0;
-  int stable_count = 0;
-
-  double mx=0, my=0, mz=0;
-
-  auto getFreshMarkerFromTF = [&]() -> bool {
-    if(!tf_buffer.canTransform(base_frame, marker_frame, tf2::TimePointZero, tf2::durationFromSec(0.15))){
-      return false;
-    }
-    geometry_msgs::msg::TransformStamped tf = tf_buffer.lookupTransform(
-      base_frame, marker_frame, tf2::TimePointZero);
-
-    const rclcpp::Time now = node->get_clock()->now();
-    const rclcpp::Time st(tf.header.stamp);
-    const double age = (now - st).seconds();
-    if(age > max_tf_age_sec) return false;
-
-    const double x = tf.transform.translation.x;
-    const double y = tf.transform.translation.y;
-    const double z = tf.transform.translation.z;
-    if(!isFinite(x)||!isFinite(y)||!isFinite(z)) return false;
-
-    mx = medianPush(fx, x, FILTER_N);
-    my = medianPush(fy, y, FILTER_N);
-    mz = medianPush(fz, z, FILTER_N);
-    return true;
-  };
-
-  rclcpp::Rate rate(10);
+  rclcpp::Rate loop(20);
 
   while(rclcpp::ok()){
-    const bool visible = getFreshMarkerFromTF();
-
-    switch(state){
-      case FSM::SEARCH: {
-        stable_count = 0;
-        fx.clear(); fy.clear(); fz.clear();
-
-        if(visible){
-          RCLCPP_INFO(node->get_logger(), ">> Target seen -> STABILIZE");
-          state = FSM::STABILIZE;
-          break;
-        }
-
-        RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 1500,
-                             ">> SEARCH waypoint %d", wp_idx);
-        arm.setJointValueTarget(waypoints[wp_idx]);
-        arm.move();
-        wp_idx = (wp_idx + 1) % waypoints.size();
-        rclcpp::sleep_for(200ms);
-      } break;
-
-      case FSM::STABILIZE: {
-        if(!visible){
-          RCLCPP_WARN(node->get_logger(), ">> Lost target -> SEARCH");
-          state = FSM::SEARCH;
-          break;
-        }
-
-        stable_count++;
-        RCLCPP_INFO(node->get_logger(), ">> STABILIZE %d/%d  raw=(%.3f %.3f %.3f)",
-                    stable_count, stable_need, mx, my, mz);
-
-        if(stable_count >= stable_need){
-          state = FSM::APPROACH;
-          RCLCPP_INFO(node->get_logger(), ">> STABILIZE done -> APPROACH");
-        }
-      } break;
-
-      case FSM::APPROACH: {
-        if(!visible){
-          RCLCPP_WARN(node->get_logger(), ">> Lost target -> STABILIZE");
-          stable_count = 0;
-          state = FSM::STABILIZE;
-          break;
-        }
-
-        // ✅ 오로지 TF값(mx,my,mz)로 목표 생성 (offset 없음)
-        // 단, 안전 클램프만 적용
-        const double tx = std::clamp(mx, -max_xy, max_xy);
-        const double ty = std::clamp(my, -max_xy, max_xy);
-        const double tz = std::clamp(mz,  min_z,  max_z);
-
-        RCLCPP_INFO(node->get_logger(), ">> APPROACH tf=(%.3f %.3f %.3f) clamped=(%.3f %.3f %.3f)",
-                    mx, my, mz, tx, ty, tz);
-
-        arm.setStartStateToCurrentState();
-        arm.setPositionTarget(tx, ty, tz);
-
-        auto res = arm.move();
-        if(res != moveit::core::MoveItErrorCode::SUCCESS){
-          RCLCPP_WARN(node->get_logger(), ">> Move failed (Invalid goal?). Back to STABILIZE");
-          stable_count = 0;
-          state = FSM::STABILIZE;
-          break;
-        }
-
-        state = FSM::GRASP;
-        RCLCPP_INFO(node->get_logger(), ">> Arrived -> GRASP");
-      } break;
-
-      case FSM::GRASP: {
-        (void)operateGripperBlocking(node, gripper, GRIP_CLOSE, GRIP_EFFORT);
-        state = FSM::LIFT_AND_HOME;
-      } break;
-
-      case FSM::LIFT_AND_HOME: {
-        auto cur = arm.getCurrentPose();
-        cur.header.frame_id = base_frame;
-        cur.pose.position.z += 0.10;
-
-        arm.setStartStateToCurrentState();
-        arm.setPoseTarget(cur);
-        arm.move();
-
-        arm.setNamedTarget("home");
-        arm.move();
-
-        (void)operateGripperBlocking(node, gripper, GRIP_OPEN, GRIP_EFFORT);
-        state = FSM::SEARCH;
-      } break;
+    if(state == FSM::HOME){
+      RCLCPP_INFO(node->get_logger(), ">> HOME: go home, open gripper");
+      arm.setNamedTarget("home");
+      arm.move();
+      rclcpp::sleep_for(300ms);
+      (void)operateGripperBlocking(node, gripper, GRIP_OPEN, GRIP_EFFORT);
+      grasp_ok_count = 0;
+      state = FSM::TRACK;
     }
 
-    rate.sleep();
+    if(state == FSM::TRACK){
+      // TF: camera -> marker
+      if(!tf_buffer.canTransform(camera_frame, marker_frame, tf2::TimePointZero, tf2::durationFromSec(0.1))){
+        grasp_ok_count = 0;
+        RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 1000,
+                             "Waiting TF %s -> %s", camera_frame.c_str(), marker_frame.c_str());
+        loop.sleep();
+        continue;
+      }
+
+      auto tf = tf_buffer.lookupTransform(camera_frame, marker_frame, tf2::TimePointZero);
+
+      // Freshness
+      const rclcpp::Time now = node->get_clock()->now();
+      const rclcpp::Time st(tf.header.stamp);
+      const double age = (now - st).seconds();
+      if(age > max_tf_age_sec){
+        grasp_ok_count = 0;
+        loop.sleep();
+        continue;
+      }
+
+      const double x = tf.transform.translation.x;
+      const double y = tf.transform.translation.y;
+      const double z = tf.transform.translation.z;
+
+      if(!isFinite(x)||!isFinite(y)||!isFinite(z) || z <= 0.05){
+        grasp_ok_count = 0;
+        loop.sleep();
+        continue;
+      }
+
+      const double yaw_err   = std::atan2(x, z);
+      const double pitch_err = std::atan2(-y, z);
+
+      // “그리퍼 끝” 기준 거리 근사
+      const double z_grip = z - camera_to_grip;
+      const double dist_err = (z_grip - grasp_distance);
+
+      const bool centered = (std::abs(yaw_err) < yaw_tol) && (std::abs(pitch_err) < pitch_tol);
+      const bool dist_ok  = (std::abs(dist_err) < grasp_tol);
+
+      RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 500,
+                           "TRACK yaw=%.1fdeg pitch=%.1fdeg z=%.3f z_grip=%.3f dist_err=%.3f",
+                           yaw_err*180.0/M_PI, pitch_err*180.0/M_PI, z, z_grip, dist_err);
+
+      if(centered && dist_ok){
+        grasp_ok_count++;
+      }else{
+        grasp_ok_count = 0;
+      }
+
+      if(grasp_ok_count >= grasp_need){
+        RCLCPP_INFO(node->get_logger(), ">> GRASP condition satisfied (%d/%d).", grasp_ok_count, grasp_need);
+        state = FSM::GRASP;
+        continue;
+      }
+
+      // Rate-limit commands to avoid PREEMPTED
+      if((now - last_cmd_time) < cmd_period){
+        loop.sleep();
+        continue;
+      }
+      last_cmd_time = now;
+
+      // Joint servo (small increments)
+      auto joints = arm.getCurrentJointValues();
+      if(joints.size() != joint_names.size()){
+        grasp_ok_count = 0;
+        loop.sleep();
+        continue;
+      }
+
+      // Centering increments (sign - : 너가 쓰던 기준)
+      double d1 = clamp(-K_yaw   * yaw_err,   -max_step_rad, max_step_rad);
+      double d2 = clamp(-K_pitch * pitch_err, -max_step_rad, max_step_rad);
+
+      // Forward increment only when roughly centered (to keep marker in view)
+      double d3 = 0.0;
+      if(centered){
+        d3 = clamp(+K_forward * dist_err, -max_step_rad, max_step_rad);
+        // dist_err > 0 이면 멀다 -> 앞으로(팔을 뻗는 방향) 가야 함.
+        // joint3의 부호가 반대면 여기만 -로 바꾸면 됨.
+      }
+
+      joints[idx_j1] += d1;
+      joints[idx_j2] += d2;
+      joints[idx_j3] += d3;
+
+      // joint4는 유지 (카메라 방향 급변 방지)
+      if(idx_j4 >= 0){
+        joints[idx_j4] = joints[idx_j4];
+      }
+
+      arm.setStartStateToCurrentState();
+      arm.setJointValueTarget(joints);
+      auto res = arm.move();
+      if(res != moveit::core::MoveItErrorCode::SUCCESS){
+        // 실패해도 그냥 계속 추적 (HOME으로 튀지 않게)
+        grasp_ok_count = 0;
+      }
+    }
+
+    if(state == FSM::GRASP){
+      RCLCPP_INFO(node->get_logger(), ">> Closing gripper");
+      (void)operateGripperBlocking(node, gripper, GRIP_CLOSE, GRIP_EFFORT);
+      state = FSM::DONE;
+    }
+
+    if(state == FSM::DONE){
+      // 필요하면 lift/home 추가 가능. 일단 정지.
+      RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 2000,
+                           ">> DONE (holding).");
+    }
+
+    loop.sleep();
   }
 
   rclcpp::shutdown();
