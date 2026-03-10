@@ -1,501 +1,942 @@
-// ===============================
-// ROS2 기본 노드 기능을 사용하기 위한 라이브러리
-// 노드를 생성하고 로그 출력, 파라미터 사용 등을 가능하게 한다.
-// ===============================
-#include <rclcpp/rclcpp.hpp>
+// real_pick_node.cpp
+// =====================================================================================
+// [이 노드가 하는 일: 전체 흐름 요약]
+//  - (0) ROS2 노드/Executor/TF/MoveIt/ActionClient 초기화
+//  - (1) /aruco/markers 를 구독해서 "현재 보이는 마커 ID 리스트"를 계속 업데이트
+//  - (2) TF로 camera_frame <- (marker_frame_prefix + id) 를 조회해서 "진짜 거리" 기준으로 가장 가까운 마커 선택
+//  - (3) 선택한 마커를 기준으로 FSM 수행
+//      HOME_INIT
+//        -> home pose로 이동 + 그리퍼 오픈
+//      WAIT_MARKER
+//        -> 유효 TF가 잡히는 마커가 나타날 때까지 대기(가장 가까운 마커 선택)
+//      CENTER_ON_MARKER
+//        -> camera_frame 기준 마커가 카메라 중심으로 오도록 yaw/pitch 조인트를 P 제어 + step 제한으로 조금씩 조정
+//        -> 일정 횟수(center_need) 연속으로 중심 허용오차(yaw_tol/pitch_tol) 만족하면 접근 단계로
+//      APPROACH_CONTINUOUS
+//        -> base_frame 기준 marker 위치를 계속 갱신하면서 EE(end-effector)를 step으로 접근
+//        -> close_dist_mode에 따라 (카메라 거리) 또는 (base에서 EE-마커 거리) 기준으로 close_dist_m 이하면 GRASP
+//        -> 목표 변화량이 충분히 클 때만 move() 호출(min_pose_delta_m)로 과부하 완화
+//      GRASP
+//        -> 그리퍼 닫기
+//      LIFT_HOME
+//        -> EE Z를 lift_dist만큼 들어올리고, home으로 복귀한 뒤 WAIT_MARKER로 재시작
+//
+// [개선 포인트(리스크 대응)]
+// 1) Gripper: future.wait_for로 main이 action 결과를 막아버리는 리스크 줄이기
+//    - async_send_goal + result_callback에서 condition_variable notify -> main은 cv로 대기
+// 2) Marker 선택: ArucoMarkers::poses[i].z 가정 제거 -> TF 거리로 선택
+// 3) Frame 유연화: marker_frame_prefix 파라미터
+// 4) TF age check 안정화: max_tf_age_sec<=0이면 age 체크 off, stamp==0 스킵, 음수 age 허용 옵션
+// 5) 카메라 축 모델 대응: camera_model = optical/link
+// 6) yaw/pitch 조인트: joints[0], joints[1] 가정 제거 -> joint name 기반 setJointValueTarget(map)
+// 7) 접근 orientation: 필요 시 fixed quaternion 사용 가능(use_fixed_orientation)
+// 8) move() 과다 완화: 목표 pose 변화량이 일정 이상일 때만 move()
+// 9) close_dist 기준: camera 거리 / base에서 EE-마커 거리 선택 가능
+// 10) home named target 실패 대비 로그 및 흐름 유지
+// =====================================================================================
 
-// ROS2 Action 통신을 위한 라이브러리
-// 로봇에게 "시간이 걸리는 명령"을 보내기 위해 사용
-// (예: 그리퍼 열기/닫기)
+#include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
 
-// 그리퍼 제어용 action 정의
-// 그리퍼의 목표 위치(position)와 힘(max_effort)을 보낼 수 있다.
 #include <control_msgs/action/gripper_command.hpp>
-
-// MoveIt 라이브러리
-// 로봇 팔을 움직이기 위한 motion planning 라이브러리
 #include <moveit/move_group_interface/move_group_interface.h>
 
-// TF2 라이브러리
-// 서로 다른 좌표계 사이의 위치 변환을 처리한다.
-// 예:
-// camera_frame → marker_frame
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-// ROS 메시지 타입
-// 좌표 변환 메시지
 #include <geometry_msgs/msg/transform_stamped.hpp>
-
-// 로봇 위치 메시지
 #include <geometry_msgs/msg/pose.hpp>
 
-// ArUco 마커 검출 메시지
 #include <ros2_aruco_interfaces/msg/aruco_markers.hpp>
 
-// 시간 관련 라이브러리
 #include <chrono>
-
-// 멀티스레딩
 #include <thread>
-
-// mutex (데이터 보호)
 #include <mutex>
-
-// 벡터 자료구조
 #include <vector>
-
-// 알고리즘 라이브러리 (max/min)
 #include <algorithm>
-
-// 수학 라이브러리
 #include <cmath>
-
-// 문자열 처리
 #include <string>
-
-// future (비동기 처리)
 #include <future>
+#include <condition_variable>
+#include <unordered_map>
 
-// chrono 단위 사용 쉽게 하기
 using namespace std::chrono_literals;
 
-
-// ===============================
-// 타입 이름 줄이기 (alias)
-// ===============================
-
-// 그리퍼 액션 타입
+// ---- 타입 alias ----
 using GripperCommand = control_msgs::action::GripperCommand;
-
-// Aruco marker 메시지 타입
 using ArucoMarkers   = ros2_aruco_interfaces::msg::ArucoMarkers;
 
+// =====================================================================================
+// [유틸 함수들]
+// =====================================================================================
 
-
-// ===============================
-// clamp 함수
-// 값을 특정 범위 안으로 제한하는 함수
-//
-// 예
-// clamp(15,0,10) -> 10
-// clamp(-5,0,10) -> 0
-// ===============================
+// clamp: v를 [lo, hi] 범위로 제한
 static double clampd(double v, double lo, double hi) {
   return std::max(lo, std::min(hi, v));
 }
 
+// 유한값인지(NaN/inf 아닌지) 체크
+static bool isFinite(double v) { return std::isfinite(v); }
 
-// ===============================
-// 숫자가 정상값인지 확인
-// NaN 또는 infinity 방지
-// ===============================
-static bool isFinite(double v) {
-  return std::isfinite(v);
-}
-
-
-// ===============================
-// 3차원 거리 계산
-//
-// sqrt(x^2 + y^2 + z^2)
-//
-// 마커와 카메라 사이 거리 계산에 사용
-// ===============================
+// 3D 거리 계산
 static double distXYZ(double x, double y, double z) {
   return std::sqrt(x*x + y*y + z*z);
 }
 
-
-
-// ===============================
-// 목표점으로 조금씩 이동하는 함수
-//
-// 현재 위치 -> 목표 위치
-//
-// 한 번에 너무 많이 움직이면 위험하기 때문에
-// max_step 만큼만 이동
-// ===============================
+// stepToward: cur에서 tgt로 max_step만큼만 이동 (루프당 이동량 제한)
+// - 큰 점프/덜컥임/충돌 위험 완화
 static double stepToward(double cur, double tgt, double max_step) {
-
   const double d = tgt - cur;
-
-  if (std::abs(d) <= max_step)
-    return tgt;
-
+  if (std::abs(d) <= max_step) return tgt;
   return cur + (d > 0 ? max_step : -max_step);
 }
 
+// posDelta: 두 Pose의 position 차이(norm)
+// - move() 호출 빈도를 줄이기 위한 "목표 변화량" 측정에 사용
+static double posDelta(const geometry_msgs::msg::Pose& a, const geometry_msgs::msg::Pose& b) {
+  const double dx = a.position.x - b.position.x;
+  const double dy = a.position.y - b.position.y;
+  const double dz = a.position.z - b.position.z;
+  return std::sqrt(dx*dx + dy*dy + dz*dz);
+}
 
-
-// ===============================
-// 그리퍼를 열거나 닫는 함수
-//
-// ROS2 Action을 사용
-// ===============================
-static bool operateGripper(
-
-  // ROS 노드
-  rclcpp::Node * node,
-
-  // action client
-  const rclcpp_action::Client<GripperCommand>::SharedPtr & client,
-
-  // 목표 위치
+// =====================================================================================
+// [그리퍼 동작 (개선 버전)]
+// - async_send_goal + result_callback에서 done을 true로 만들고 cv.notify_one()
+// - main thread는 condition_variable로 "결과가 올 때까지" 기다림(타임아웃 포함)
+// - executor thread는 계속 spin 중이므로 결과 콜백이 제대로 처리될 가능성이 큼
+// =====================================================================================
+static bool operateGripperImproved(
+  rclcpp::Node* node,
+  const rclcpp_action::Client<GripperCommand>::SharedPtr& client,
   double pos,
-
-  // 힘
   double effort = 10.0,
-
-  // 서버 대기 시간
   std::chrono::milliseconds server_wait = 2000ms,
-
-  // goal 응답 대기
-  std::chrono::milliseconds goal_wait   = 8000ms,
-
-  // 결과 대기
-  std::chrono::milliseconds result_wait = 12000ms
-)
-
-{
-
-  // action server 존재 확인
+  std::chrono::milliseconds total_wait  = 15000ms
+) {
+  // (1) 액션 서버 대기
   if (!client->wait_for_action_server(server_wait)) {
     RCLCPP_ERROR(node->get_logger(), "Gripper action server not available");
     return false;
   }
 
-  // goal 메시지 생성
+  // (2) goal 구성
   GripperCommand::Goal goal;
+  goal.command.position = pos;       // 목표 열기/닫기 위치
+  goal.command.max_effort = effort;  // 힘 제한
 
-  goal.command.position = pos;
+  // (3) 결과 전달용 동기화 도구
+  std::mutex mtx;
+  std::condition_variable cv;
+  bool done = false;  // 결과 도착 여부
+  bool ok = false;    // 성공 여부
 
-  goal.command.max_effort = effort;
-
-
-  // action 옵션
+  // (4) goal 옵션 설정
   rclcpp_action::Client<GripperCommand>::SendGoalOptions opt;
 
-
-  // goal 응답 콜백
+  // goal 수락/거절 로그
   opt.goal_response_callback =
-    [node](const rclcpp_action::ClientGoalHandle<GripperCommand>::SharedPtr & gh) {
-
-      if (!gh)
+    [node](const rclcpp_action::ClientGoalHandle<GripperCommand>::SharedPtr& gh) {
+      if (!gh) {
         RCLCPP_ERROR(node->get_logger(), "Gripper goal rejected");
-
-      else
-        RCLCPP_INFO (node->get_logger(), "Gripper goal accepted");
+      } else {
+        RCLCPP_INFO(node->get_logger(), "Gripper goal accepted");
+      }
     };
 
+  // 결과 콜백: executor thread에서 호출됨
+  opt.result_callback =
+    [node, &mtx, &cv, &done, &ok](
+      const rclcpp_action::ClientGoalHandle<GripperCommand>::WrappedResult& res
+    ) {
+      // SUCCEEDED 여부 확인
+      bool success = (res.code == rclcpp_action::ResultCode::SUCCEEDED);
+      if (!success) {
+        RCLCPP_ERROR(node->get_logger(),
+                     "Gripper result failed (code=%d)",
+                     static_cast<int>(res.code));
+      }
 
-  // goal 전송
-  auto fut_goal = client->async_send_goal(goal, opt);
+      // done/ok 업데이트 후 notify
+      {
+        std::lock_guard<std::mutex> lk(mtx);
+        ok = success;
+        done = true;
+      }
+      cv.notify_one();
+    };
 
-  // goal 응답 대기
-  if (fut_goal.wait_for(goal_wait) != std::future_status::ready) {
-    RCLCPP_ERROR(node->get_logger(), "Gripper send_goal timeout");
+  // (5) goal 전송 (여기서는 future.get()로 대기하지 않음)
+  (void)client->async_send_goal(goal, opt);
+
+  // (6) 결과 대기(타임아웃)
+  std::unique_lock<std::mutex> lk(mtx);
+  if (!cv.wait_for(lk, total_wait, [&](){ return done; })) {
+    RCLCPP_ERROR(node->get_logger(), "Gripper timeout waiting result");
     return false;
   }
 
-
-  // goal handle
-  auto gh = fut_goal.get();
-
-  if (!gh) {
-    RCLCPP_ERROR(node->get_logger(), "Gripper goal rejected");
-    return false;
-  }
-
-
-  // 결과 요청
-  auto fut_res = client->async_get_result(gh);
-
-  if (fut_res.wait_for(result_wait) != std::future_status::ready) {
-    RCLCPP_ERROR(node->get_logger(), "Gripper result timeout");
-    return false;
-  }
-
-
-  auto wrapped = fut_res.get();
-
-  if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED) {
-    RCLCPP_ERROR(node->get_logger(), "Gripper failed");
-    return false;
-  }
-
-  return true;
+  // (7) 결과 반환
+  return ok;
 }
 
-
-
-// ===============================
-// FSM 상태 정의
-//
-// 로봇 동작 흐름
-//
-// HOME_INIT
-// WAIT_MARKER
-// CENTER_ON_MARKER
-// APPROACH_CONTINUOUS
-// GRASP
-// LIFT_HOME
-// ===============================
+// =====================================================================================
+// [FSM 상태 정의]
+// =====================================================================================
 enum class FSM {
-
-  HOME_INIT,
-
-  WAIT_MARKER,
-
-  CENTER_ON_MARKER,
-
-  APPROACH_CONTINUOUS,
-
-  GRASP,
-
-  LIFT_HOME
+  HOME_INIT,           // home 이동 + 그리퍼 오픈
+  WAIT_MARKER,         // 유효 TF 마커 등장 대기(가장 가까운 마커 선택)
+  CENTER_ON_MARKER,    // yaw/pitch 조인트로 센터링
+  APPROACH_CONTINUOUS, // EE를 마커로 step 접근(연속 업데이트)
+  GRASP,               // 그리퍼 닫기
+  LIFT_HOME            // 들어올리고 home 복귀
 };
 
-
-
-// ===============================
-// 프로그램 시작
-// ===============================
 int main(int argc, char** argv) {
-
-
-  // ROS2 초기화
+  // ===================================================================================
+  // (0) ROS2 초기화
+  // ===================================================================================
   rclcpp::init(argc, argv);
 
-
-  // 노드 옵션
+  // NodeOptions:
+  // - launch/cli에서 넘어온 파라미터 override를 자동 declare
   rclcpp::NodeOptions opts;
-
   opts.automatically_declare_parameters_from_overrides(true);
 
-
-  // 노드 생성
+  // ===================================================================================
+  // (1) 노드 생성
+  // ===================================================================================
   auto node = std::make_shared<rclcpp::Node>("real_pick_node", opts);
 
-
-
-  // 멀티스레드 executor
+  // ===================================================================================
+  // (2) Executor를 별도 스레드에서 spin
+  //  - TF listener / subscriber / action callbacks는 executor 스레드에서 처리됨
+  //  - main 스레드는 아래 FSM 루프를 수행
+  // ===================================================================================
   auto exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
-
   exec->add_node(node);
-
-
-  // executor 스레드 실행
   std::thread spinner([&exec](){ exec->spin(); });
 
-
-
-  // TF buffer 생성
-  auto tf_buffer  = std::make_unique<tf2_ros::Buffer>(node->get_clock());
-
-  // TF listener 생성
+  // ===================================================================================
+  // (3) TF Buffer/Listener 초기화
+  //  - Buffer는 node clock 사용(use_sim_time일 경우 /clock과 연동)
+  //  - TransformListener가 TF를 subscribe하여 buffer에 축적
+  // ===================================================================================
+  auto tf_buffer   = std::make_unique<tf2_ros::Buffer>(node->get_clock());
   auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
-
-
-  // MoveIt 인터페이스 생성
-  // "arm" 그룹을 제어
+  // ===================================================================================
+  // (4) MoveIt MoveGroupInterface (arm)
+  //  - planning group 이름이 "arm"이어야 함
+  // ===================================================================================
   moveit::planning_interface::MoveGroupInterface arm(node, "arm");
 
+  // ===================================================================================
+  // (5) 파라미터: 프레임/토픽 설정
+  // ===================================================================================
+  const std::string base_frame    = node->declare_parameter<std::string>("base_frame", "link1");
+  const std::string camera_frame  = node->declare_parameter<std::string>(
+                                      "camera_frame", "camera_color_optical_frame");
+  const std::string markers_topic = node->declare_parameter<std::string>("markers_topic", "/aruco/markers");
 
+  // marker TF 프레임 접두사(환경별로 aruco_marker_, aruco_ 등)
+  const std::string marker_frame_prefix =
+    node->declare_parameter<std::string>("marker_frame_prefix", "aruco_marker_");
 
-  // ===============================
-  // 파라미터 설정
-  // ===============================
+  // ===================================================================================
+  // (6) MoveIt 튜닝 파라미터 적용
+  // ===================================================================================
+  arm.setPoseReferenceFrame(base_frame); // PoseTarget 해석 기준 프레임
 
-  const std::string base_frame =
-  node->declare_parameter<std::string>("base_frame", "link1");
+  arm.setMaxVelocityScalingFactor(node->declare_parameter<double>("vel_scale", 0.20));
+  arm.setMaxAccelerationScalingFactor(node->declare_parameter<double>("acc_scale", 0.20));
 
+  arm.setPlanningTime(node->declare_parameter<double>("planning_time", 3.0));
 
-  const std::string camera_frame =
-  node->declare_parameter<std::string>("camera_frame", "camera_link");
+  arm.setGoalPositionTolerance(node->declare_parameter<double>("pos_tol", 0.01));
+  arm.setGoalOrientationTolerance(node->declare_parameter<double>("ori_tol", 0.10));
 
+  // named target 이름(home)도 파라미터로 받음
+  const std::string home_target = node->declare_parameter<std::string>("home_target", "home");
 
-  const std::string markers_topic =
-  node->declare_parameter<std::string>("markers_topic", "/aruco/markers");
+  // ===================================================================================
+  // (7) Gripper action client 준비 (Reentrant callback group)
+  // ===================================================================================
+  auto gripper_cb_group = node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
+  // gripper 액션 서버 이름은 환경에 맞게 수정 필요할 수 있음
+  auto gripper = rclcpp_action::create_client<GripperCommand>(
+      node, "/gripper_controller/gripper_cmd", gripper_cb_group);
 
+  // 그리퍼 열기/닫기 파라미터
+  const double GRIP_OPEN  = node->declare_parameter<double>("grip_open", 0.019);
+  const double GRIP_CLOSE = node->declare_parameter<double>("grip_close", 0.0);
+  const double GRIP_EFFORT_OPEN  = node->declare_parameter<double>("grip_effort_open", 10.0);
+  const double GRIP_EFFORT_CLOSE = node->declare_parameter<double>("grip_effort_close", 30.0);
 
-  // MoveIt 속도 설정
-  arm.setMaxVelocityScalingFactor(0.20);
+  // ===================================================================================
+  // (8) TF 신선도/타임 설정
+  // ===================================================================================
+  const double max_tf_age_sec      = node->declare_parameter<double>("max_tf_age_sec", 1.0);
+  const bool allow_negative_age    = node->declare_parameter<bool>("allow_negative_age", true);
+  const int tf_can_timeout_ms      = node->declare_parameter<int>("tf_can_timeout_ms", 80);
 
-  arm.setMaxAccelerationScalingFactor(0.20);
+  // ===================================================================================
+  // (9) 카메라 축 모델(오차 계산 방식 선택)
+  //  - optical: x=right, y=down, z=forward(일반적 camera optical frame)
+  //  - link: 환경에 따라 축이 달라질 수 있으므로 필요 시 바꿔서 테스트
+  // ===================================================================================
+  const std::string camera_model   = node->declare_parameter<std::string>("camera_model", "optical");
 
+  // ===================================================================================
+  // (10) 마커 선택 거리 범위(TF 기반 거리)
+  // ===================================================================================
+  const double marker_dist_min     = node->declare_parameter<double>("marker_dist_min", 0.05);
+  const double marker_dist_max     = node->declare_parameter<double>("marker_dist_max", 2.00);
 
-  // planning 시간
-  arm.setPlanningTime(3.0);
+  // ===================================================================================
+  // (11) 센터링 제어 파라미터
+  // ===================================================================================
+  const double K_yaw               = node->declare_parameter<double>("K_yaw", 0.6);
+  const double K_pitch             = node->declare_parameter<double>("K_pitch", 0.6);
+  const double max_step_rad        = node->declare_parameter<double>("max_step_rad", 0.12);
 
+  // 축/조인트 방향이 반대일 수 있어 부호를 파라미터로 조절
+  node->declare_parameter<int>("yaw_cmd_sign", -1);
+  node->declare_parameter<int>("pitch_cmd_sign", +1);
 
-  // 위치 오차 허용
-  arm.setGoalPositionTolerance(0.01);
+  // 센터링 허용 오차 + 연속 만족 횟수
+  const double yaw_tol_rad         = node->declare_parameter<double>("yaw_tol_deg", 3.0) * M_PI / 180.0;
+  const double pitch_tol_rad       = node->declare_parameter<double>("pitch_tol_deg", 3.0) * M_PI / 180.0;
+  const int center_need            = node->declare_parameter<int>("center_need", 5);
 
+  // yaw/pitch 조인트 이름 기반(인덱스 가정 제거)
+  const std::string yaw_joint_name   = node->declare_parameter<std::string>("yaw_joint_name", "joint1");
+  const std::string pitch_joint_name = node->declare_parameter<std::string>("pitch_joint_name", "joint2");
 
-  // 방향 오차 허용
-  arm.setGoalOrientationTolerance(3.14);
+  // yaw/pitch 조인트 한계(안전/계획 실패 완화)
+  const double yaw_min             = node->declare_parameter<double>("yaw_min", -M_PI);
+  const double yaw_max             = node->declare_parameter<double>("yaw_max",  M_PI);
+  const double pitch_min           = node->declare_parameter<double>("pitch_min", -1.5);
+  const double pitch_max           = node->declare_parameter<double>("pitch_max",  1.5);
 
+  // ===================================================================================
+  // (12) 접근(연속 tracking) 파라미터
+  // ===================================================================================
+  const double xy_max              = node->declare_parameter<double>("xy_max", 0.30);
+  const double z_min               = node->declare_parameter<double>("z_min", 0.05);
+  const double z_max               = node->declare_parameter<double>("z_max", 0.35);
+  const double approach_dx         = node->declare_parameter<double>("approach_dx", 0.06);
+  const double max_step_m          = node->declare_parameter<double>("max_step_m", 0.05);
 
+  // move() 과다 호출 완화: 목표 변화가 일정 이상일 때만 실행
+  const double min_pose_delta_m    = node->declare_parameter<double>("min_pose_delta_m", 0.008);
 
-  // ===============================
-  // Gripper action client 생성
-  // ===============================
-  auto gripper_cb_group =
-  node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  // close 판단 모드 + 임계값
+  //  - camera: camera_frame에서 마커까지 거리로 판단
+  //  - base_ee_to_marker: base에서 EE 위치와 마커 위치 거리로 판단
+  const std::string close_dist_mode = node->declare_parameter<std::string>("close_dist_mode", "camera");
+  const double close_dist_m         = node->declare_parameter<double>("close_dist_m", 0.10);
 
+  // 집은 후 들어올리기(EE Z 증가량)
+  const double lift_dist            = node->declare_parameter<double>("lift_dist", 0.10);
 
-  auto gripper =
-  rclcpp_action::create_client<GripperCommand>(
-      node,
-      "/gripper_controller/gripper_cmd",
-      gripper_cb_group
+  // 접근 시 orientation 고정 옵션
+  const bool use_fixed_orientation  = node->declare_parameter<bool>("use_fixed_orientation", false);
+  const double fixed_qx             = node->declare_parameter<double>("fixed_qx", 0.0);
+  const double fixed_qy             = node->declare_parameter<double>("fixed_qy", 0.0);
+  const double fixed_qz             = node->declare_parameter<double>("fixed_qz", 0.0);
+  const double fixed_qw             = node->declare_parameter<double>("fixed_qw", 1.0);
+
+  // MoveIt 실패 누적 시 리셋
+  int fail_count = 0;
+  const int max_fail = node->declare_parameter<int>("max_fail", 3);
+
+  // ===================================================================================
+  // (13) /aruco/markers 구독
+  //  - 여기서는 marker_ids만 저장(poses는 신뢰하지 않고 TF를 사용)
+  //  - callback은 executor 스레드에서 돌고, main은 mutex로 안전하게 복사해서 사용
+  // ===================================================================================
+  std::mutex mk_mtx;
+  std::vector<int> latest_ids;   // 마지막으로 받은 마커 ID 목록
+  bool have_markers = false;     // 한 번이라도 메시지 받았는지 여부
+
+  auto sub = node->create_subscription<ArucoMarkers>(
+    markers_topic, 10,
+    [&](const ArucoMarkers::SharedPtr msg){
+      std::lock_guard<std::mutex> lk(mk_mtx);
+      latest_ids = msg->marker_ids;
+      have_markers = true;
+    }
   );
 
+  // ===================================================================================
+  // (14) getFreshTF: TF 조회 + 신선도/유효성 검사
+  //  - canTransform으로 timeout 내 가능 여부 확인
+  //  - lookupTransform(TimePointZero)로 최신 TF 사용
+  //  - max_tf_age_sec > 0이면 age 검사
+  //    * stamp==0이면 age 검사 생략(정적 TF)
+  //    * 음수 age(시간 튐)는 allow_negative_age로 제어
+  //  - translation 값 NaN/inf 검사
+  // ===================================================================================
+  auto getFreshTF = [&](const std::string& target,
+                        const std::string& source,
+                        geometry_msgs::msg::TransformStamped& out) -> bool
+  {
+    try {
+      const auto timeout = std::chrono::milliseconds(tf_can_timeout_ms);
 
-
-  // ===============================
-  // FSM 상태 변수
-  // ===============================
-  FSM state = FSM::HOME_INIT;
-
-
-
-  // 현재 타겟 마커
-  int target_id = -1;
-
-
-  std::string target_frame;
-
-
-
-  // ===============================
-  // 메인 루프
-  // ===============================
-
-  rclcpp::Rate rate(10);
-
-
-  while (rclcpp::ok()) {
-
-    switch (state) {
-
-
-
-      // ===============================
-      // HOME 상태
-      // ===============================
-      case FSM::HOME_INIT: {
-
-        // 로봇 팔을 home 위치로 이동
-        arm.setNamedTarget("home");
-
-        arm.move();
-
-
-        // 그리퍼 열기
-        operateGripper(node.get(), gripper, 0.019);
-
-
-        // 다음 상태
-        state = FSM::WAIT_MARKER;
-
-        break;
+      // (1) 변환 가능 여부 확인
+      if (!tf_buffer->canTransform(target, source, tf2::TimePointZero, timeout)) {
+        return false;
       }
 
+      // (2) 최신 TF 조회
+      auto t = tf_buffer->lookupTransform(target, source, tf2::TimePointZero);
 
+      // (3) age check (옵션)
+      if (max_tf_age_sec > 0.0) {
+        // stamp가 0이면 정적 TF 가능성이 높으므로 age 체크 생략
+        if (!(t.header.stamp.sec == 0 && t.header.stamp.nanosec == 0)) {
+          const rclcpp::Time now   = node->get_clock()->now();
+          const rclcpp::Time stamp = rclcpp::Time(t.header.stamp);
+          const double age = (now - stamp).seconds();
 
-      // ===============================
-      // 마커 탐색
-      // ===============================
-      case FSM::WAIT_MARKER: {
+          // 시간 튐(음수 age) 허용 여부
+          if (!allow_negative_age && age < 0.0) return false;
 
-        // 마커 탐지 대기
-
-        // 마커 발견되면
-        // CENTER_ON_MARKER 상태로 이동
-
-        break;
+          // 너무 오래된 TF 거부
+          if (age > max_tf_age_sec) return false;
+        }
       }
 
+      // (4) translation 유효성 검사
+      const auto &tr = t.transform.translation;
+      if (!isFinite(tr.x) || !isFinite(tr.y) || !isFinite(tr.z)) return false;
 
+      out = t;
+      return true;
+    } catch (...) {
+      // TF 예외 발생 시 실패 처리
+      return false;
+    }
+  };
 
-      // ===============================
-      // 마커 센터링
-      // ===============================
-      case FSM::CENTER_ON_MARKER: {
+  // ===================================================================================
+  // (15) selectClosestMarkerByTF: TF 거리로 가장 가까운 마커 선택
+  //  - /aruco/markers에서 받은 latest_ids를 복사해온 뒤
+  //  - 각 id에 대해 camera_frame <- (marker_frame_prefix + id) TF를 조회
+  //  - translation 거리(d) 계산 후, [marker_dist_min, marker_dist_max] 내에서 최소 d 선택
+  // ===================================================================================
+  auto selectClosestMarkerByTF = [&]() -> int {
+    // (1) 최신 ID 리스트 복사
+    std::vector<int> ids;
+    {
+      std::lock_guard<std::mutex> lk(mk_mtx);
+      if (!have_markers) return -1;
+      ids = latest_ids;
+    }
+    if (ids.empty()) return -1;
 
-        // 카메라 기준 마커 위치 얻기
+    // (2) 최소 거리 마커 찾기
+    int best_id = -1;
+    double best_dist = 1e9;
 
-        // yaw pitch 계산
+    for (int id : ids) {
+      const std::string marker_frame = marker_frame_prefix + std::to_string(id);
 
-        // 관절을 조금씩 움직여서
-        // 마커를 카메라 중앙으로 이동
-
-        break;
+      geometry_msgs::msg::TransformStamped t_cam_marker;
+      if (!getFreshTF(camera_frame, marker_frame, t_cam_marker)) {
+        // TF가 없는 마커는 스킵
+        continue;
       }
 
+      const double x = t_cam_marker.transform.translation.x;
+      const double y = t_cam_marker.transform.translation.y;
+      const double z = t_cam_marker.transform.translation.z;
+      const double d = distXYZ(x, y, z);
 
+      if (!isFinite(d)) continue;
+      if (d < marker_dist_min || d > marker_dist_max) continue;
 
-      // ===============================
-      // 마커 접근
-      // ===============================
-      case FSM::APPROACH_CONTINUOUS: {
-
-        // base_frame 기준 마커 위치 계산
-
-        // end effector 목표 위치 계산
-
-        // stepToward로 조금씩 접근
-
-        break;
+      if (d < best_dist) {
+        best_dist = d;
+        best_id = id;
       }
-
-
-
-      // ===============================
-      // 물체 잡기
-      // ===============================
-      case FSM::GRASP: {
-
-        // 그리퍼 닫기
-
-        operateGripper(node.get(), gripper, 0.0);
-
-        state = FSM::LIFT_HOME;
-
-        break;
-      }
-
-
-
-      // ===============================
-      // 물체 들어올리고 home
-      // ===============================
-      case FSM::LIFT_HOME: {
-
-        // z축 위로 이동
-
-        // home 복귀
-
-        state = FSM::WAIT_MARKER;
-
-        break;
-      }
-
     }
 
+    return best_id;
+  };
+
+  // ===================================================================================
+  // (16) computeYawPitchErr: 카메라 좌표축 모델에 따른 yaw/pitch 오차 계산
+  //  - optical:
+  //      yaw_err   = atan2(x, z)
+  //      pitch_err = atan2(-y, z)
+  //  - link(가정):
+  //      yaw_err   = atan2(y, x)
+  //      pitch_err = atan2(-z, x)
+  // ===================================================================================
+  auto computeYawPitchErr = [&](double x, double y, double z, double& yaw_err, double& pitch_err) {
+    if (camera_model == "link") {
+      // x forward, y left, z up 가정(환경마다 다를 수 있음)
+      yaw_err   = std::atan2(y, x);
+      pitch_err = std::atan2(-z, x);
+    } else {
+      // optical 기본
+      yaw_err   = std::atan2(x, z);
+      pitch_err = std::atan2(-y, z);
+    }
+  };
+
+  // ===================================================================================
+  // (17) getJointMap: MoveIt에서 조인트 이름/현재값을 map으로 변환
+  //  - setJointValueTarget(map<string,double>) 호출에 사용
+  // ===================================================================================
+  auto getJointMap = [&]() -> std::unordered_map<std::string, double> {
+    std::unordered_map<std::string, double> m;
+    auto names = arm.getJointNames();
+    auto vals  = arm.getCurrentJointValues();
+    for (size_t i = 0; i < names.size() && i < vals.size(); i++) {
+      m[names[i]] = vals[i];
+    }
+    return m;
+  };
+
+  // ===================================================================================
+  // (18) FSM 상태 변수 초기화
+  // ===================================================================================
+  FSM state = FSM::HOME_INIT;
+
+  int target_id = -1;            // 현재 타겟 마커 ID
+  std::string target_frame;      // 현재 타겟 마커 프레임 이름(prefix+id)
+
+  bool opened_on_detect = false; // 마커 감지 후 그리퍼 오픈을 1회만 하기 위한 플래그
+  int center_count = 0;          // 센터링 조건 연속 만족 카운터
+
+  // 접근 단계에서 move() 과다를 줄이기 위한 last target 저장
+  bool have_last_tgt = false;
+  geometry_msgs::msg::Pose last_tgt_pose;
+
+  // 메인 루프 주기(10Hz)
+  rclcpp::Rate rate(10);
+
+  // ===================================================================================
+  // (19) 메인 FSM 루프
+  // ===================================================================================
+  while (rclcpp::ok()) {
+    switch (state) {
+
+      // -----------------------------------------------------------------------------
+      // HOME_INIT:
+      //  - home pose로 이동(가능하면)
+      //  - 그리퍼 오픈
+      //  - 상태 변수 리셋
+      //  - 다음 상태: WAIT_MARKER
+      // -----------------------------------------------------------------------------
+      case FSM::HOME_INIT: {
+        RCLCPP_INFO(node->get_logger(), ">> HOME_INIT: home + open gripper");
+
+        // (1) home 이동
+        arm.setNamedTarget(home_target);
+        auto home_res = arm.move();
+
+        // named target이 없거나 planning 실패 시 로그만 남기고 계속 진행
+        if (home_res != moveit::core::MoveItErrorCode::SUCCESS) {
+          RCLCPP_ERROR(node->get_logger(),
+                       "HOME move failed. Check SRDF named target: %s",
+                       home_target.c_str());
+          rclcpp::sleep_for(500ms);
+        }
+
+        // (2) 그리퍼 오픈
+        (void)operateGripperImproved(node.get(), gripper, GRIP_OPEN, GRIP_EFFORT_OPEN);
+
+        // (3) 상태 변수 리셋
+        fail_count = 0;
+        center_count = 0;
+        target_id = -1;
+        target_frame.clear();
+        opened_on_detect = false;
+        have_last_tgt = false;
+
+        // (4) 다음 상태
+        state = FSM::WAIT_MARKER;
+        break;
+      }
+
+      // -----------------------------------------------------------------------------
+      // WAIT_MARKER:
+      //  - /aruco/markers에서 받은 최신 ID 목록 중
+      //  - TF 거리 기반으로 가장 가까운 마커를 선택
+      //  - 타겟이 바뀌면 target_frame 갱신 및 카운터 리셋
+      //  - camera_frame <- target_frame TF로 로그 출력
+      //  - 마커 최초 감지 시 그리퍼 오픈 1회
+      //  - 다음 상태: CENTER_ON_MARKER
+      // -----------------------------------------------------------------------------
+      case FSM::WAIT_MARKER: {
+        // (1) TF 기반 가장 가까운 마커 선택
+        const int best = selectClosestMarkerByTF();
+
+        // (2) 유효 마커가 없으면 대기
+        if (best < 0) {
+          center_count = 0;
+          opened_on_detect = false;
+
+          RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 2000,
+                               ">> WAIT_MARKER: no valid TF marker yet");
+          break;
+        }
+
+        // (3) 타겟 마커가 바뀌면 frame 및 상태 변수 리셋
+        if (best != target_id) {
+          target_id = best;
+          target_frame = marker_frame_prefix + std::to_string(target_id);
+
+          center_count = 0;
+          opened_on_detect = false;
+          have_last_tgt = false;
+
+          RCLCPP_INFO(node->get_logger(),
+                      ">> Target marker ID=%d (frame=%s)",
+                      target_id, target_frame.c_str());
+        }
+
+        // (4) camera_frame <- marker TF로 현재 거리/좌표 출력
+        geometry_msgs::msg::TransformStamped t_cam_marker;
+        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+          // TF 순간 끊김 -> 다음 루프에서 다시 시도
+          center_count = 0;
+          break;
+        }
+
+        const double mx = t_cam_marker.transform.translation.x;
+        const double my = t_cam_marker.transform.translation.y;
+        const double mz = t_cam_marker.transform.translation.z;
+        const double md = distXYZ(mx, my, mz);
+
+        RCLCPP_INFO(node->get_logger(),
+                    ">> MARKER(cam<-marker): xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
+                    mx, my, mz, md);
+
+        // (5) 마커 감지 후 그리퍼를 한번 열어두기
+        if (!opened_on_detect) {
+          RCLCPP_INFO(node->get_logger(), ">> Marker detected! Open gripper.");
+          (void)operateGripperImproved(node.get(), gripper, GRIP_OPEN, GRIP_EFFORT_OPEN);
+          opened_on_detect = true;
+        }
+
+        // (6) 센터링 단계로
+        state = FSM::CENTER_ON_MARKER;
+        break;
+      }
+
+      // -----------------------------------------------------------------------------
+      // CENTER_ON_MARKER:
+      //  - camera_frame <- target_frame TF로 마커 좌표 획득
+      //  - 카메라 축 모델에 맞춰 yaw/pitch 오차 계산
+      //  - yaw/pitch 조인트를 이름 기반으로 P 제어 + step 제한으로 업데이트
+      //  - 목표 오차가 허용범위 이내일 때 center_count++ (연속 필요)
+      //  - MoveIt move() 실패가 누적되면 HOME_INIT으로 리셋
+      //  - center_count >= center_need 이면 APPROACH_CONTINUOUS로 이동
+      // -----------------------------------------------------------------------------
+      case FSM::CENTER_ON_MARKER: {
+        // (0) 타겟 프레임이 없으면 WAIT로
+        if (target_frame.empty()) {
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (1) camera_frame <- marker TF 조회
+        geometry_msgs::msg::TransformStamped t_cam_marker;
+        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+          center_count = 0;
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (2) 카메라 기준 마커 위치/거리
+        const double x = t_cam_marker.transform.translation.x;
+        const double y = t_cam_marker.transform.translation.y;
+        const double z = t_cam_marker.transform.translation.z;
+        const double d = distXYZ(x, y, z);
+
+        RCLCPP_INFO(node->get_logger(),
+                    ">> CENTER: cam xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
+                    x, y, z, d);
+
+        // (3) close 판단(camera 모드일 때만 여기서 즉시 GRASP 가능)
+        if (close_dist_mode == "camera" && d <= close_dist_m) {
+          RCLCPP_INFO(node->get_logger(), ">> Within %.2fm(camera) -> GRASP", close_dist_m);
+          state = FSM::GRASP;
+          break;
+        }
+
+        // (4) yaw/pitch 오차 계산
+        double yaw_err = 0.0;
+        double pitch_err = 0.0;
+        computeYawPitchErr(x, y, z, yaw_err, pitch_err);
+
+        // (5) 허용오차 만족 여부로 center_count 누적
+        if (std::abs(yaw_err) < yaw_tol_rad && std::abs(pitch_err) < pitch_tol_rad) {
+          center_count++;
+          RCLCPP_INFO(node->get_logger(), ">> CENTER OK %d/%d", center_count, center_need);
+        } else {
+          center_count = 0;
+        }
+
+        // (6) 현재 조인트 map 생성(이름 기반)
+        auto jm = getJointMap();
+
+        // (7) yaw/pitch 조인트가 존재하는지 확인
+        if (jm.find(yaw_joint_name) == jm.end() || jm.find(pitch_joint_name) == jm.end()) {
+          RCLCPP_ERROR(node->get_logger(),
+                       "Centering joints not found. yaw_joint_name=%s pitch_joint_name=%s",
+                       yaw_joint_name.c_str(), pitch_joint_name.c_str());
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (8) 부호 파라미터 로드(방향 뒤집기)
+        int yaw_cmd_sign = -1;
+        int pitch_cmd_sign = +1;
+        node->get_parameter("yaw_cmd_sign", yaw_cmd_sign);
+        node->get_parameter("pitch_cmd_sign", pitch_cmd_sign);
+        yaw_cmd_sign = (yaw_cmd_sign >= 0) ? 1 : -1;
+        pitch_cmd_sign = (pitch_cmd_sign >= 0) ? 1 : -1;
+
+        // (9) P 제어 + step 제한
+        const double dyaw   = clampd(yaw_cmd_sign * K_yaw * yaw_err, -max_step_rad, max_step_rad);
+        const double dpitch = clampd(-pitch_cmd_sign * K_pitch * pitch_err, -max_step_rad, max_step_rad);
+
+        // (10) 조인트 업데이트 + limit clamp
+        jm[yaw_joint_name]   = clampd(jm[yaw_joint_name]   + dyaw,   yaw_min,   yaw_max);
+        jm[pitch_joint_name] = clampd(jm[pitch_joint_name] + dpitch, pitch_min, pitch_max);
+
+        // (11) MoveIt 실행: 현재 상태를 start state로 설정 후 joint target 적용
+        arm.setStartStateToCurrentState();
+        arm.setJointValueTarget(jm);
+
+        auto res = arm.move();
+
+        // (12) 실패 처리(누적 시 리셋)
+        if (res != moveit::core::MoveItErrorCode::SUCCESS) {
+          fail_count++;
+          RCLCPP_WARN(node->get_logger(), "CENTER move failed (%d/%d)", fail_count, max_fail);
+          if (fail_count >= max_fail) state = FSM::HOME_INIT;
+          else state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (13) 성공 시 fail_count 리셋
+        fail_count = 0;
+
+        // (14) center_need번 연속 만족하면 접근 단계로
+        if (center_count >= center_need) {
+          RCLCPP_INFO(node->get_logger(), ">> CENTER DONE -> APPROACH_CONTINUOUS");
+          state = FSM::APPROACH_CONTINUOUS;
+        }
+
+        break;
+      }
+
+      // -----------------------------------------------------------------------------
+      // APPROACH_CONTINUOUS:
+      //  - camera_frame <- marker TF로 camera 거리 계산(옵션: close_dist_mode=camera일 때 사용)
+      //  - base_frame   <- marker TF로 base 기준 마커 위치 획득
+      //  - close_dist_mode에 따라 GRASP 조건 체크
+      //  - 목표점(goal) = marker position + approach_dx (base X 방향 오프셋)
+      //  - EE 현재 pose에서 목표로 stepToward로 조금씩 이동
+      //  - 목표 변화량이 충분히 클 때만 move() 호출(min_pose_delta_m)
+      //  - move 실패 누적 시 HOME_INIT, 아니면 CENTER로 돌아가 재정렬
+      // -----------------------------------------------------------------------------
+      case FSM::APPROACH_CONTINUOUS: {
+        // (0) 타겟 없으면 WAIT로
+        if (target_frame.empty()) {
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (1) camera_frame <- marker TF 조회
+        geometry_msgs::msg::TransformStamped t_cam_marker;
+        if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (2) camera 기준 거리 계산
+        const double cx = t_cam_marker.transform.translation.x;
+        const double cy = t_cam_marker.transform.translation.y;
+        const double cz = t_cam_marker.transform.translation.z;
+        const double cd = distXYZ(cx, cy, cz);
+
+        // (3) base_frame <- marker TF 조회
+        geometry_msgs::msg::TransformStamped t_base_marker;
+        if (!getFreshTF(base_frame, target_frame, t_base_marker)) {
+          state = FSM::WAIT_MARKER;
+          break;
+        }
+
+        // (4) base 기준 마커 좌표
+        const double bx = t_base_marker.transform.translation.x;
+        const double by = t_base_marker.transform.translation.y;
+        const double bz = t_base_marker.transform.translation.z;
+
+        // (5) close 조건 체크
+        //  - camera: cd <= close_dist_m
+        //  - base_ee_to_marker: base에서 ee와 marker 간 거리 <= close_dist_m
+        if (close_dist_mode == "camera") {
+          if (cd <= close_dist_m) {
+            RCLCPP_INFO(node->get_logger(), ">> Within %.2fm(camera) -> GRASP", close_dist_m);
+            state = FSM::GRASP;
+            break;
+          }
+        } else if (close_dist_mode == "base_ee_to_marker") {
+          auto ee_now = arm.getCurrentPose().pose;
+          const double dd = distXYZ(ee_now.position.x - bx, ee_now.position.y - by, ee_now.position.z - bz);
+          if (dd <= close_dist_m) {
+            RCLCPP_INFO(node->get_logger(), ">> Within %.2fm(base ee-marker) -> GRASP", close_dist_m);
+            state = FSM::GRASP;
+            break;
+          }
+        }
+
+        // (6) 디버그 로그
+        RCLCPP_INFO(node->get_logger(),
+                    ">> TRACK: cam_dist=%.3f  base_marker=(%.3f %.3f %.3f)",
+                    cd, bx, by, bz);
+
+        // (7) 목표점(가상 접근점) 계산 + clamp
+        const double goal_x = clampd(bx + approach_dx, -xy_max, xy_max);
+        const double goal_y = clampd(by,              -xy_max, xy_max);
+        const double goal_z = clampd(bz,               z_min,  z_max);
+
+        // (8) 현재 EE pose
+        auto ee_now = arm.getCurrentPose().pose;
+
+        // (9) 목표 pose 구성
+        geometry_msgs::msg::Pose tgt = ee_now;
+
+        // (10) orientation 처리
+        //  - 기본: 현재 orientation 유지
+        //  - 옵션: fixed quaternion으로 강제
+        if (use_fixed_orientation) {
+          tgt.orientation.x = fixed_qx;
+          tgt.orientation.y = fixed_qy;
+          tgt.orientation.z = fixed_qz;
+          tgt.orientation.w = fixed_qw;
+        }
+
+        // (11) position step 접근
+        tgt.position.x = stepToward(ee_now.position.x, goal_x, max_step_m);
+        tgt.position.y = stepToward(ee_now.position.y, goal_y, max_step_m);
+        tgt.position.z = stepToward(ee_now.position.z, goal_z, max_step_m);
+
+        // (12) 목표 변화량이 너무 작으면 move() 생략(과부하/덜컥임 완화)
+        if (have_last_tgt && posDelta(tgt, last_tgt_pose) < min_pose_delta_m) {
+          break;
+        }
+        last_tgt_pose = tgt;
+        have_last_tgt = true;
+
+        // (13) 목표 로그
+        RCLCPP_INFO(node->get_logger(),
+                    ">> TARGET(step): (%.3f %.3f %.3f) -> (%.3f %.3f %.3f)",
+                    ee_now.position.x, ee_now.position.y, ee_now.position.z,
+                    tgt.position.x,    tgt.position.y,    tgt.position.z);
+
+        // (14) MoveIt PoseTarget 설정 및 실행
+        arm.setStartStateToCurrentState();
+        arm.setPoseTarget(tgt);
+
+        auto res = arm.move();
+
+        // (15) PoseTarget 클리어(누적 방지)
+        arm.clearPoseTargets();
+
+        // (16) 실패 처리
+        if (res != moveit::core::MoveItErrorCode::SUCCESS) {
+          fail_count++;
+          RCLCPP_WARN(node->get_logger(), "TRACK move failed (%d/%d)", fail_count, max_fail);
+          if (fail_count >= max_fail) state = FSM::HOME_INIT;
+          else state = FSM::CENTER_ON_MARKER; // 실패 시 다시 센터링해서 재정렬
+        } else {
+          fail_count = 0;
+        }
+
+        break;
+      }
+
+      // -----------------------------------------------------------------------------
+      // GRASP:
+      //  - 그리퍼 닫기
+      //  - 다음 상태: LIFT_HOME
+      // -----------------------------------------------------------------------------
+      case FSM::GRASP: {
+        RCLCPP_INFO(node->get_logger(), ">> GRASP: close gripper");
+
+        (void)operateGripperImproved(node.get(), gripper, GRIP_CLOSE, GRIP_EFFORT_CLOSE);
+
+        state = FSM::LIFT_HOME;
+        break;
+      }
+
+      // -----------------------------------------------------------------------------
+      // LIFT_HOME:
+      //  - 현재 EE pose에서 z를 lift_dist만큼 증가시켜 lift
+      //  - home_target으로 복귀
+      //  - 상태 변수 리셋 후 WAIT_MARKER로
+      // -----------------------------------------------------------------------------
+      case FSM::LIFT_HOME: {
+        RCLCPP_INFO(node->get_logger(), ">> LIFT_HOME: lift and home");
+
+        // (1) 현재 EE pose
+        auto ee = arm.getCurrentPose().pose;
+
+        // (2) lift pose 생성(orientation 유지)
+        geometry_msgs::msg::Pose lift_pose = ee;
+        lift_pose.position.z = clampd(lift_pose.position.z + lift_dist, z_min, z_max);
+
+        // (3) lift 실행
+        arm.setStartStateToCurrentState();
+        arm.setPoseTarget(lift_pose);
+        auto lift_res = arm.move();
+        arm.clearPoseTargets();
+
+        if (lift_res != moveit::core::MoveItErrorCode::SUCCESS) {
+          RCLCPP_WARN(node->get_logger(), "Lift move failed, continue to home anyway");
+        }
+
+        // (4) home 복귀
+        arm.setNamedTarget(home_target);
+        auto home_res = arm.move();
+        if (home_res != moveit::core::MoveItErrorCode::SUCCESS) {
+          RCLCPP_ERROR(node->get_logger(),
+                       "Home move failed after lift. Check SRDF named target: %s",
+                       home_target.c_str());
+        }
+
+        // (5) 상태 변수 리셋
+        center_count = 0;
+        fail_count = 0;
+        opened_on_detect = false;
+        have_last_tgt = false;
+
+        // (6) 다음 상태
+        state = FSM::WAIT_MARKER;
+        break;
+      }
+    }
+
+    // 루프 주기 유지(10Hz)
     rate.sleep();
   }
 
-
+  // ===================================================================================
+  // (20) 종료 처리
+  // ===================================================================================
   rclcpp::shutdown();
-
-  if (spinner.joinable())
-    spinner.join();
-
+  if (spinner.joinable()) spinner.join();
   return 0;
 }
