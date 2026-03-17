@@ -1,9 +1,3 @@
-// real_pick_node.cpp
-// - Track ARUCO marker CENTER continuously (no latch)
-// - Keep centering with yaw/pitch joints, then continuously approach with live TF updates
-// - Close gripper when camera->marker distance <= 0.20m
-// - Avoid "Node already added to executor" by NOT using spin_until_future_complete
-// - Use MultiThreadedExecutor + Reentrant callback group for action client stability
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -48,7 +42,6 @@ static double stepToward(double cur, double tgt, double max_step) {
   return cur + (d > 0 ? max_step : -max_step);
 }
 
-// IMPORTANT: No spin_until_future_complete here (node is already spinning in executor thread).
 static bool operateGripper(
   rclcpp::Node * node,
   const rclcpp_action::Client<GripperCommand>::SharedPtr & client,
@@ -119,7 +112,6 @@ int main(int argc, char** argv) {
 
   auto node = std::make_shared<rclcpp::Node>("real_pick_node", opts);
 
-  // Executor thread: TF/sub/action callbacks run here
   auto exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
   exec->add_node(node);
   std::thread spinner([&exec](){ exec->spin(); });
@@ -129,20 +121,16 @@ int main(int argc, char** argv) {
 
   moveit::planning_interface::MoveGroupInterface arm(node, "arm");
 
-  // ---- Frames / Topics ----
   const std::string base_frame    = node->declare_parameter<std::string>("base_frame", "link1");
   const std::string camera_frame  = node->declare_parameter<std::string>("camera_frame", "camera_link");
   const std::string markers_topic = node->declare_parameter<std::string>("markers_topic", "/aruco/markers");
 
-  // ---- MoveIt tuning ----
-  arm.setPoseReferenceFrame(base_frame);
   arm.setMaxVelocityScalingFactor(node->declare_parameter<double>("vel_scale", 0.20));
   arm.setMaxAccelerationScalingFactor(node->declare_parameter<double>("acc_scale", 0.20));
   arm.setPlanningTime(node->declare_parameter<double>("planning_time", 3.0));
   arm.setGoalPositionTolerance(node->declare_parameter<double>("pos_tol", 0.01));
   arm.setGoalOrientationTolerance(node->declare_parameter<double>("ori_tol", 3.14));
 
-  // ---- Gripper action client with Reentrant callback group ----
   auto gripper_cb_group = node->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
   auto gripper = rclcpp_action::create_client<GripperCommand>(
       node, "/gripper_controller/gripper_cmd", gripper_cb_group);
@@ -152,14 +140,11 @@ int main(int argc, char** argv) {
   const double GRIP_EFFORT_OPEN  = node->declare_parameter<double>("grip_effort_open", 10.0);
   const double GRIP_EFFORT_CLOSE = node->declare_parameter<double>("grip_effort_close", 30.0);
 
-  // ---- TF freshness ----
   const double max_tf_age_sec = node->declare_parameter<double>("max_tf_age_sec", 1.0);
 
-  // ---- Marker selection constraints (camera Z range) ----
   const double marker_z_min = node->declare_parameter<double>("marker_z_min", 0.05);
   const double marker_z_max = node->declare_parameter<double>("marker_z_max", 2.00);
 
-  // ---- Centering controller (joint space) ----
   const double K_yaw       = node->declare_parameter<double>("K_yaw", 0.6);
   const double K_pitch     = node->declare_parameter<double>("K_pitch", 0.6);
   const double max_step_rad= node->declare_parameter<double>("max_step_rad", 0.12);
@@ -171,33 +156,27 @@ int main(int argc, char** argv) {
   const double pitch_tol_rad = node->declare_parameter<double>("pitch_tol_deg", 3.0) * M_PI / 180.0;
   const int center_need      = node->declare_parameter<int>("center_need", 5);
 
-  // Joint bounds used for centering (adjust if needed)
   const double j1_min = node->declare_parameter<double>("j1_min", -M_PI);
   const double j1_max = node->declare_parameter<double>("j1_max",  M_PI);
   const double j2_min = node->declare_parameter<double>("j2_min", -1.5);
   const double j2_max = node->declare_parameter<double>("j2_max",  1.5);
 
-  // ---- Continuous approach settings (base frame) ----
+
   const double xy_max      = node->declare_parameter<double>("xy_max", 0.30);
   const double z_min       = node->declare_parameter<double>("z_min", 0.05);
   const double z_max       = node->declare_parameter<double>("z_max", 0.35);
 
-  // "Virtual point" offset along base X (positive/negative depends on your robot)
   const double approach_dx = node->declare_parameter<double>("approach_dx", 0.06);
 
-  // Step limit per loop (avoid big jumps)
   const double max_step_m  = node->declare_parameter<double>("max_step_m", 0.05);
 
-  // Close threshold in camera distance
   const double close_dist_m = node->declare_parameter<double>("close_dist_m", 0.10);
 
-  // Lift after grasp
   const double lift_dist   = node->declare_parameter<double>("lift_dist", 0.10);
 
   int fail_count = 0;
   const int max_fail = node->declare_parameter<int>("max_fail", 3);
 
-  // ---- ArUco subscription ----
   std::mutex mk_mtx;
   ArucoMarkers latest;
   bool have_markers = false;
@@ -241,7 +220,6 @@ int main(int argc, char** argv) {
 
       auto t = tf_buffer->lookupTransform(target, source, tf2::TimePointZero);
 
-      // If stamp is zero, skip age check (static TF / no stamp)
       if (!(t.header.stamp.sec == 0 && t.header.stamp.nanosec == 0)) {
         const rclcpp::Time now = node->get_clock()->now();
         const rclcpp::Time stamp = rclcpp::Time(t.header.stamp);
@@ -259,7 +237,6 @@ int main(int argc, char** argv) {
     }
   };
 
-  // ---- FSM state ----
   FSM state = FSM::HOME_INIT;
 
   int target_id = -1;
@@ -267,6 +244,10 @@ int main(int argc, char** argv) {
 
   bool opened_on_detect = false;
   int center_count = 0;
+
+  RCLCPP_INFO(node->get_logger(), "MoveIt planning_frame=%s", arm.getPlanningFrame().c_str());
+  RCLCPP_INFO(node->get_logger(), "MoveIt pose_ref_frame=%s", arm.getPoseReferenceFrame().c_str());
+  RCLCPP_INFO(node->get_logger(), "MoveIt eef_link=%s", arm.getEndEffectorLink().c_str());
 
   rclcpp::Rate rate(10);
 
@@ -357,7 +338,6 @@ int main(int argc, char** argv) {
                     ">> CENTER: cam xyz=(%.3f, %.3f, %.3f) dist=%.3f m",
                     x, y, z, d);
 
-        // Close immediately if already within threshold
         if (d <= close_dist_m) {
           RCLCPP_INFO(node->get_logger(), ">> Within %.2fm -> GRASP", close_dist_m);
           state = FSM::GRASP;
@@ -374,7 +354,6 @@ int main(int argc, char** argv) {
           center_count = 0;
         }
 
-        // Update head joints (assumes joints[0]=yaw, joints[1]=pitch)
         std::vector<double> joints = arm.getCurrentJointValues();
         if (joints.size() < 2) {
           state = FSM::WAIT_MARKER;
@@ -400,9 +379,9 @@ int main(int argc, char** argv) {
         auto res = arm.move();
         if (res != moveit::core::MoveItErrorCode::SUCCESS) {
           fail_count++;
-          RCLCPP_WARN(node->get_logger(), "CENTER move failed (%d/%d)", fail_count, max_fail);
-          if (fail_count >= max_fail) state = FSM::HOME_INIT;
-          else state = FSM::WAIT_MARKER;
+          RCLCPP_WARN(node->get_logger(), "CENTER move failed (%d/%d) -> back to WAIT",
+                      fail_count, max_fail);
+          state = FSM::WAIT_MARKER;
           break;
         } else {
           fail_count = 0;
@@ -422,7 +401,6 @@ int main(int argc, char** argv) {
           break;
         }
 
-        // 1) Camera distance check (close when <= 20cm)
         geometry_msgs::msg::TransformStamped t_cam_marker;
         if (!getFreshTF(camera_frame, target_frame, t_cam_marker)) {
           state = FSM::WAIT_MARKER;
@@ -444,7 +422,6 @@ int main(int argc, char** argv) {
           break;
         }
 
-        // 2) Base-frame marker center -> continuously update target
         geometry_msgs::msg::TransformStamped t_base_marker;
         if (!getFreshTF(base_frame, target_frame, t_base_marker)) {
           state = FSM::WAIT_MARKER;
@@ -455,34 +432,44 @@ int main(int argc, char** argv) {
         const double by = t_base_marker.transform.translation.y;
         const double bz = t_base_marker.transform.translation.z;
 
-        // Virtual target (marker center + approach_dx in base X)
-        const double goal_x = clampd(bx + approach_dx, -xy_max, xy_max);
-        const double goal_y = clampd(by,             -xy_max, xy_max);
-        const double goal_z = clampd(bz,              z_min,  z_max);
+        const double goal_x = bx + approach_dx;
+        const double goal_y = by;
+        const double goal_z = clampd(bz, z_min, z_max);
 
         auto ee_now = arm.getCurrentPose().pose;
 
-        geometry_msgs::msg::Pose tgt = ee_now; // keep orientation
-        tgt.position.x = stepToward(ee_now.position.x, goal_x, max_step_m);
-        tgt.position.y = stepToward(ee_now.position.y, goal_y, max_step_m);
-        tgt.position.z = stepToward(ee_now.position.z, goal_z, max_step_m);
+        const double tgt_x = stepToward(ee_now.position.x, goal_x, max_step_m);
+        const double tgt_y = stepToward(ee_now.position.y, goal_y, max_step_m);
+        const double tgt_z = stepToward(ee_now.position.z, goal_z, max_step_m);
 
         RCLCPP_INFO(node->get_logger(),
-                    ">> TRACK(base): marker=(%.3f %.3f %.3f) goal=(%.3f %.3f %.3f) step=(%.3f %.3f %.3f)",
-                    bx, by, bz, goal_x, goal_y, goal_z,
-                    tgt.position.x, tgt.position.y, tgt.position.z);
+          ">> APPROACH DBG: EE=(%.3f %.3f %.3f) goal_raw=(%.3f %.3f %.3f) tgt=(%.3f %.3f %.3f) (xy_max=%.2f z=[%.2f..%.2f])",
+          ee_now.position.x, ee_now.position.y, ee_now.position.z,
+          goal_x, goal_y, goal_z,
+          tgt_x, tgt_y, tgt_z,
+          xy_max, z_min, z_max
+        );
 
         arm.setStartStateToCurrentState();
-        arm.setPoseTarget(tgt);
+
+        arm.setPositionTarget(tgt_x, tgt_y, tgt_z);
 
         auto res = arm.move();
         arm.clearPoseTargets();
 
         if (res != moveit::core::MoveItErrorCode::SUCCESS) {
           fail_count++;
-          RCLCPP_WARN(node->get_logger(), "TRACK move failed (%d/%d)", fail_count, max_fail);
-          if (fail_count >= max_fail) state = FSM::HOME_INIT;
-          else state = FSM::CENTER_ON_MARKER;
+          RCLCPP_WARN(node->get_logger(), "APPROACH move failed (%d/%d) -> back to CENTER",
+                      fail_count, max_fail);
+
+          if (fail_count >= max_fail) {
+            fail_count = 0;         
+            center_count = 0;
+            state = FSM::WAIT_MARKER; 
+          } else {
+            center_count = 0;
+            state = FSM::CENTER_ON_MARKER;
+          }
         } else {
           fail_count = 0;
         }
